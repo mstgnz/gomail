@@ -21,12 +21,12 @@ import (
 func main() {
     // Create a Mail struct and set the necessary fields
     mail := &Mail{
-        from:    "sender@example.com",
-        name:    "Sender Name",
-        host:    "smtp.example.com",
-        port:    "587",
-        user:    "username",
-        pass:    "password",
+        From:    "sender@example.com",
+        Name:    "Sender Name",
+        Host:    "smtp.example.com",
+        Port:    "587",
+        User:    "username",
+        Pass:    "password",
     }
 
     // Send the email with text
