@@ -25,6 +25,8 @@ type Mail struct {
 	Cc          []string
 	Bcc         []string
 	Attachments map[string][]byte
+	Timeout     time.Duration
+	KeepAlive   time.Duration
 }
 
 // SetFrom sets the sender's email address
@@ -93,6 +95,18 @@ func (m *Mail) SetBcc(bcc ...string) *Mail {
 	return m
 }
 
+// SetTimeout
+func (m *Mail) SetTimeout(timeout time.Duration) *Mail {
+	m.Timeout = timeout
+	return m
+}
+
+// SetKeepAlive
+func (m *Mail) SetKeepAlive(keepAlive time.Duration) *Mail {
+	m.KeepAlive = keepAlive
+	return m
+}
+
 // SetAttachment sets the email attachments
 func (m *Mail) SetAttachment(attachments map[string][]byte) *Mail {
 	m.Attachments = attachments
@@ -148,8 +162,8 @@ func (m *Mail) send() error {
 
 	// Connection timeout setting
 	dialer := &net.Dialer{
-		Timeout:   15 * time.Second,
-		KeepAlive: 30 * time.Second,
+		Timeout:   m.getTimeout() * time.Second,
+		KeepAlive: m.getKeepAlive() * time.Second,
 	}
 
 	// Connecting to the SMTP server
@@ -228,4 +242,18 @@ func (m *Mail) validate() bool {
 func (m *Mail) isEmailValid(email string) bool {
 	regex := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
 	return regexp.MustCompile(regex).MatchString(email)
+}
+
+func (m *Mail) getTimeout() time.Duration {
+	if m.Timeout == 0 {
+		return 15
+	}
+	return m.Timeout
+}
+
+func (m *Mail) getKeepAlive() time.Duration {
+	if m.KeepAlive == 0 {
+		return 30
+	}
+	return m.KeepAlive
 }
