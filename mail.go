@@ -1,14 +1,17 @@
 package gomail
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/smtp"
+	"os"
 	"regexp"
 	"strings"
+	"text/template"
 	"time"
 )
 
@@ -113,16 +116,38 @@ func (m *Mail) SetAttachment(attachments map[string][]byte) *Mail {
 	return m
 }
 
-// SendText sends the email with plain text content
-func (m *Mail) SendText() error {
-	m.Subject = "text/plain: " + m.Subject
+func (m *Mail) Send() error {
 	return m.send()
 }
 
-// SendHTML sends the email with HTML content
-func (m *Mail) SendHTML() error {
-	m.Subject = "text/html: " + m.Subject
+// SendFile loads an HTML file and renders it with dynamic data
+func (m *Mail) SendHtml(filePath string, data map[string]any) error {
+	content, err := RenderTemplate(filePath, data)
+	if err != nil {
+		return err
+	}
+	m.Content = content
 	return m.send()
+}
+
+// RenderTemplate renders an HTML template with dynamic data
+func RenderTemplate(filePath string, data map[string]any) (string, error) {
+	fileContent, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+
+	tmpl, err := template.New("email").Parse(string(fileContent))
+	if err != nil {
+		return "", err
+	}
+
+	var renderedContent bytes.Buffer
+	if err := tmpl.Execute(&renderedContent, data); err != nil {
+		return "", err
+	}
+
+	return renderedContent.String(), nil
 }
 
 // Send sends the email
@@ -143,7 +168,7 @@ func (m *Mail) send() error {
 	message.WriteString("Content-Type: multipart/mixed; boundary=BOUNDARY\n\n")
 
 	// Add email content
-	message.WriteString(fmt.Sprintf("--BOUNDARY\nContent-Type: text/plain\n\n%s\n\n", m.Content))
+	message.WriteString(fmt.Sprintf("--BOUNDARY\nContent-Type: text/html; charset=\"UTF-8\"\n\n%s\n\n", m.Content))
 
 	// Add attachments
 	for filename, data := range m.Attachments {
