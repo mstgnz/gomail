@@ -33,16 +33,18 @@ func main() {
     err := mail.SetSubject("Test Email").
         SetContent("This is a test email.").
         SetTo([]string{"recipient@example.com"}).
-        SendText()
+        Send()
     if err != nil {
         // Handle error
     }
 
     // Send the email with HTML
     err = mail.SetSubject("Test Email").
-        SetContent("<html><body><h1>This is a test email.</h1></body></html>").
         SetTo("recipient@example.com").
-        SendHTML()
+        SendHtml("view/forgot-password.html", map[string]any{
+			"Code": code,
+			"Link": link,
+		})
     if err != nil {
         // Handle error
     }
@@ -55,7 +57,7 @@ func main() {
         SetContent("This is a test email with attachment.").
         SetTo("recipient@example.com").
         SetAttachment(attachments).
-        SendText()
+        Send()
     if err != nil {
         // Handle error
     }
