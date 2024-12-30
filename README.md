@@ -8,6 +8,26 @@ To use the package, you need to have Go installed and Go modules enabled in your
 go get -u github.com/mstgnz/gomail
 ```
 
+## Benchmarks
+Performance benchmarks on Apple M1:
+
+```
+BenchmarkMailSend-8                    13111    83133 ns/op    14435 B/op    184 allocs/op
+BenchmarkMailSendWithAttachments-8     13074    87134 ns/op    19552 B/op    234 allocs/op
+BenchmarkMailSendAsync-8               12862    92055 ns/op    14660 B/op    187 allocs/op
+```
+
+- `MailSend`: Basic email sending without attachments
+- `MailSendWithAttachments`: Email sending with file attachments
+- `MailSendAsync`: Asynchronous email sending
+
+The benchmarks show that:
+- Basic email sending takes ~83μs per operation
+- Adding attachments increases memory allocation by ~35% but only adds ~4μs to operation time
+- Async sending has minimal overhead (~9μs) compared to synchronous sending
+
+All operations maintain efficient memory usage with relatively low allocations.
+
 ## Basic Usage
 ```go
 package main
