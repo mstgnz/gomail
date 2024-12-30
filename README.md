@@ -1,6 +1,5 @@
 # gomail
-This is a Go package for sending emails. It provides functionality to send emails using the SMTP protocol.
-
+This is a Go package for sending emails. It provides functionality to send emails using the SMTP protocol with advanced features like connection pooling, rate limiting, and TLS support.
 
 ## Installation
 To use the package, you need to have Go installed and Go modules enabled in your project. Then you can add the package to your project by running the following command:
@@ -9,8 +8,7 @@ To use the package, you need to have Go installed and Go modules enabled in your
 go get -u github.com/mstgnz/gomail
 ```
 
-
-## Usage
+## Basic Usage
 ```go
 package main
 
@@ -29,51 +27,149 @@ func main() {
         Pass:    "password",
     }
 
-    // Send the email with text
+    // Send a simple email
     err := mail.SetSubject("Test Email").
         SetContent("This is a test email.").
-        SetTo([]string{"recipient@example.com"}).
+        SetTo("recipient@example.com").
         Send()
     if err != nil {
         // Handle error
     }
 
-    // Send the email with HTML
+    // Send an email with HTML template
     err = mail.SetSubject("Test Email").
         SetTo("recipient@example.com").
-        SendHtml("view/forgot-password.html", map[string]any{
-			"Code": code,
-			"Link": link,
-		})
-    if err != nil {
-        // Handle error
-    }
-
-    // Send the email with attachment
-    attachments := map[string][]byte{
-        "file.txt": []byte("Attachment content"),
-    }
-    err = mail.SetSubject("Test Email with Attachment").
-        SetContent("This is a test email with attachment.").
-        SetTo("recipient@example.com").
-        SetAttachment(attachments).
-        Send()
+        SendHtml("templates/welcome.html", map[string]any{
+            "Name": "John",
+            "URL":  "https://example.com",
+        })
     if err != nil {
         // Handle error
     }
 }
 ```
 
+## Advanced Features
+
+### Connection Pooling
+```go
+mail := &Mail{
+    From:     "sender@example.com",
+    Name:     "Sender Name",
+    Host:     "smtp.example.com",
+    Port:     "587",
+    User:     "username",
+    Pass:     "password",
+}
+
+// Set connection pool size (default: 10)
+mail.SetPoolSize(20)
+```
+
+### Asynchronous Email Sending
+```go
+// Send email asynchronously
+result := mail.SetSubject("Test Email").
+    SetContent("This is a test email.").
+    SetTo("recipient@example.com").
+    SendAsync()
+
+// Check the result
+if err := <-result; err != nil {
+    log.Printf("Failed to send email: %v", err)
+}
+```
+
+### Large File Attachments (Streaming)
+```go
+// Stream a large file
+file, err := os.Open("large-file.zip")
+if err != nil {
+    log.Fatal(err)
+}
+defer file.Close()
+
+fileInfo, err := file.Stat()
+if err != nil {
+    log.Fatal(err)
+}
+
+attachments := []AttachmentReader{
+    {
+        Name:   "large-file.zip",
+        Reader: file,
+        Size:   fileInfo.Size(),
+    },
+}
+
+err = mail.SetSubject("Test Email with Large Attachment").
+    SetContent("This is a test email with a large attachment.").
+    SetTo("recipient@example.com").
+    SetStreamAttachment(attachments).
+    Send()
+```
+
+### Rate Limiting
+```go
+// Configure rate limiting
+mail.SetRateLimit(&RateLimit{
+    Enabled:   true,
+    PerSecond: 2, // 2 emails per second
+})
+```
+
+### TLS Configuration
+```go
+// Configure TLS settings
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           true,
+    InsecureSkipVerify: false,
+    ServerName:         "smtp.example.com",
+})
+```
+
+### Template Engine with Custom Functions
+```go
+// Configure template engine
+engine := &TemplateEngine{
+    BaseDir:    "templates",
+    DefaultExt: ".html",
+    FuncMap: template.FuncMap{
+        "upper": strings.ToUpper,
+    },
+}
+mail.SetTemplateEngine(engine)
+
+// Render template
+err := mail.RenderTemplate("welcome", data)
+```
+
+### Email Preview
+```go
+// Preview email before sending
+preview, err := mail.PreviewEmail()
+if err != nil {
+    log.Printf("Preview error: %v", err)
+}
+fmt.Println(preview)
+```
 
 ## Features
-- Uses the SMTP protocol for sending emails.
-- Provides error handling mechanism during email sending process.
-- Allows setting basic parameters required for email sending.
-
+- SMTP protocol support
+- Connection pooling for performance optimization
+- HTML template support with custom functions
+- File attachments (regular and streaming)
+- Asynchronous email sending
+- Rate limiting
+- TLS support (STARTTLS and Direct TLS)
+- CC and BCC recipients
+- Email preview
+- Configurable timeouts and keep-alive
+- Template caching
+- Comprehensive error handling
 
 ## Contributing
 Contributions are welcome! For any feedback, bug reports, or contributions, please submit an issue or pull request to the GitHub repository.
-
 
 ## License
 This package is licensed under the MIT License. See the LICENSE file for more information.
