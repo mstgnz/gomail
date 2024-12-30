@@ -2,34 +2,46 @@ package gomail
 
 import (
 	"bytes"
-	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
-	"net"
-	"net/smtp"
-	"os"
+	"mime/multipart"
+	"net/textproto"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 )
 
+// Mail represents an email message with all its configuration
 type Mail struct {
-	From        string
-	Name        string
-	Host        string
-	Port        string
-	User        string
-	Pass        string
-	Subject     string
-	Content     string
-	To          []string
-	Cc          []string
-	Bcc         []string
-	Attachments map[string][]byte
-	Timeout     time.Duration
-	KeepAlive   time.Duration
+	From              string
+	Name              string
+	Host              string
+	Port              string
+	User              string
+	Pass              string `json:"-"` // Password will be omitted from JSON
+	Subject           string
+	Content           string
+	To                []string
+	Cc                []string
+	Bcc               []string
+	Attachments       map[string][]byte
+	Timeout           time.Duration
+	KeepAlive         time.Duration
+	pool              *Pool
+	poolSize          int
+	streamAttachments []AttachmentReader
+	tlsConfig         *TLSConfig
+	rateLimiter       *time.Ticker
+	ContentType       ContentType
+	TemplateEngine    *TemplateEngine
+	templateCache     map[string]*template.Template
+	templateMutex     sync.RWMutex
 }
 
 // SetFrom sets the sender's email address
@@ -98,13 +110,13 @@ func (m *Mail) SetBcc(bcc ...string) *Mail {
 	return m
 }
 
-// SetTimeout
+// SetTimeout sets the timeout duration
 func (m *Mail) SetTimeout(timeout time.Duration) *Mail {
 	m.Timeout = timeout
 	return m
 }
 
-// SetKeepAlive
+// SetKeepAlive sets the keep-alive duration
 func (m *Mail) SetKeepAlive(keepAlive time.Duration) *Mail {
 	m.KeepAlive = keepAlive
 	return m
@@ -116,13 +128,20 @@ func (m *Mail) SetAttachment(attachments map[string][]byte) *Mail {
 	return m
 }
 
+// SetPoolSize sets the connection pool size
+func (m *Mail) SetPoolSize(size int) *Mail {
+	m.poolSize = size
+	return m
+}
+
+// Send initiates the email sending process
 func (m *Mail) Send() error {
 	return m.send()
 }
 
 // SendFile loads an HTML file and renders it with dynamic data
 func (m *Mail) SendHtml(filePath string, data map[string]any) error {
-	content, err := RenderTemplate(filePath, data)
+	content, err := SimpleRenderTemplate(filePath, data)
 	if err != nil {
 		return err
 	}
@@ -130,88 +149,34 @@ func (m *Mail) SendHtml(filePath string, data map[string]any) error {
 	return m.send()
 }
 
-// RenderTemplate renders an HTML template with dynamic data
-func RenderTemplate(filePath string, data map[string]any) (string, error) {
-	fileContent, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-
-	tmpl, err := template.New("email").Parse(string(fileContent))
-	if err != nil {
-		return "", err
-	}
-
-	var renderedContent bytes.Buffer
-	if err := tmpl.Execute(&renderedContent, data); err != nil {
-		return "", err
-	}
-
-	return renderedContent.String(), nil
-}
-
 // Send sends the email
 func (m *Mail) send() error {
 	if !m.validate() {
 		return errors.New("missing parameter")
 	}
-	addr := fmt.Sprintf("%s:%s", m.Host, m.Port)
 
-	// Create content
-	var message strings.Builder
-	message.WriteString(fmt.Sprintf("From: %s <%s>\n", m.Name, m.From))
-	message.WriteString(fmt.Sprintf("To: %s\n", strings.Join(m.To, ", ")))
-	message.WriteString(fmt.Sprintf("Cc: %s\n", strings.Join(m.Cc, ", ")))
-	message.WriteString(fmt.Sprintf("Bcc: %s\n", strings.Join(m.Bcc, ", ")))
-	message.WriteString(fmt.Sprintf("Subject: %s\n", m.Subject))
-	message.WriteString("MIME-Version: 1.0\n")
-	message.WriteString("Content-Type: multipart/mixed; boundary=BOUNDARY\n\n")
-
-	// Add email content
-	message.WriteString(fmt.Sprintf("--BOUNDARY\nContent-Type: text/html; charset=\"UTF-8\"\n\n%s\n\n", m.Content))
-
-	// Add attachments
-	for filename, data := range m.Attachments {
-		message.WriteString(fmt.Sprintf("--BOUNDARY\nContent-Disposition: attachment; filename=\"%s\"\n", filename))
-		message.WriteString("Content-Type: application/octet-stream\n\n")
-		message.Write(data)
-		message.WriteString("\n\n")
-	}
-	message.WriteString("--BOUNDARY--")
-
-	// TLS configuration for connecting to SMTP server
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         m.Host,
+	// Apply rate limiting if enabled
+	if m.rateLimiter != nil {
+		<-m.rateLimiter.C
 	}
 
-	// Connection timeout setting
-	dialer := &net.Dialer{
-		Timeout:   m.getTimeout() * time.Second,
-		KeepAlive: m.getKeepAlive() * time.Second,
+	// Initialize or use existing pool
+	if m.pool == nil {
+		pool, err := NewPool(m, m.poolSize)
+		if err != nil {
+			return fmt.Errorf("error creating pool: %v", err)
+		}
+		m.pool = pool
 	}
 
-	// Connecting to the SMTP server
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+	// Get connection from pool
+	client, err := m.pool.getConnection()
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer m.pool.releaseConnection(client)
 
-	client, err := smtp.NewClient(conn, m.Host)
-	if err != nil {
-		return err
-	}
-	defer client.Quit()
-
-	// Authentication information
-	auth := smtp.PlainAuth("", m.User, m.Pass, m.Host)
-
-	if err := client.Auth(auth); err != nil {
-		return err
-	}
-
-	// Email sending process
+	// Send email process
 	if err := client.Mail(m.From); err != nil {
 		return err
 	}
@@ -223,62 +188,258 @@ func (m *Mail) send() error {
 		}
 	}
 
-	// Start writing email content
 	w, err := client.Data()
 	if err != nil {
 		return err
 	}
 	defer w.Close()
 
-	// Write email header and body
-	_, err = w.Write([]byte(message.String()))
+	// Write email content
+	writer := multipart.NewWriter(w)
+	defer writer.Close()
+
+	// Write headers
+	headers := fmt.Sprintf("From: %s <%s>\r\n"+
+		"To: %s\r\n"+
+		"Cc: %s\r\n"+
+		"Bcc: %s\r\n"+
+		"Subject: %s\r\n"+
+		"MIME-Version: 1.0\r\n"+
+		"Content-Type: multipart/mixed; boundary=%s\r\n\r\n",
+		m.Name, m.From,
+		strings.Join(m.To, ", "),
+		strings.Join(m.Cc, ", "),
+		strings.Join(m.Bcc, ", "),
+		m.Subject,
+		writer.Boundary())
+
+	if _, err := w.Write([]byte(headers)); err != nil {
+		return err
+	}
+
+	// Content section
+	contentPart, err := writer.CreatePart(textproto.MIMEHeader{
+		"Content-Type": []string{"text/html; charset=UTF-8"},
+	})
 	if err != nil {
 		return err
+	}
+	if _, err := contentPart.Write([]byte(m.Content)); err != nil {
+		return err
+	}
+
+	// Regular attachments
+	for filename, data := range m.Attachments {
+		attachmentPart, err := writer.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              []string{"application/octet-stream"},
+			"Content-Transfer-Encoding": []string{"base64"},
+			"Content-Disposition":       []string{fmt.Sprintf(`attachment; filename="%s"`, filename)},
+		})
+		if err != nil {
+			return err
+		}
+
+		encoder := base64.NewEncoder(base64.StdEncoding, attachmentPart)
+		if _, err := encoder.Write(data); err != nil {
+			return err
+		}
+		encoder.Close()
+	}
+
+	// Streaming attachments
+	for _, attachment := range m.streamAttachments {
+		attachmentPart, err := writer.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              []string{"application/octet-stream"},
+			"Content-Transfer-Encoding": []string{"base64"},
+			"Content-Disposition":       []string{fmt.Sprintf(`attachment; filename="%s"`, attachment.Name)},
+		})
+		if err != nil {
+			return err
+		}
+
+		encoder := base64.NewEncoder(base64.StdEncoding, attachmentPart)
+		if _, err := io.Copy(encoder, attachment.Reader); err != nil {
+			return err
+		}
+		encoder.Close()
 	}
 
 	return nil
 }
 
+// validate checks if all required fields are set and valid
 func (m *Mail) validate() bool {
-	if m.From == "" || m.Name == "" || m.Host == "" || m.Port == "" || m.User == "" || m.Pass == "" || m.Subject == "" || m.Content == "" || len(m.To) == 0 {
+	// Check required fields
+	if m.From == "" || m.Name == "" || m.Host == "" || m.Port == "" ||
+		m.User == "" || m.Pass == "" || m.Subject == "" || m.Content == "" ||
+		len(m.To) == 0 {
 		return false
 	}
+
+	// Validate sender email
+	if !m.isEmailValid(m.From) {
+		log.Printf("Invalid sender email address: %s", m.From)
+		return false
+	}
+
+	// Validate recipient emails
 	for _, email := range m.To {
 		if !m.isEmailValid(email) {
-			log.Printf("This email %s is not correct.\n", email)
+			log.Printf("Invalid recipient email address: %s", email)
 			return false
 		}
 	}
+
+	// Validate CC emails if present
 	for _, email := range m.Cc {
 		if !m.isEmailValid(email) {
-			log.Printf("This email %s is not correct.\n", email)
+			log.Printf("Invalid CC email address: %s", email)
 			return false
 		}
 	}
+
+	// Validate BCC emails if present
 	for _, email := range m.Bcc {
 		if !m.isEmailValid(email) {
-			log.Printf("This email %s is not correct.\n", email)
+			log.Printf("Invalid BCC email address: %s", email)
 			return false
 		}
 	}
+
 	return true
 }
 
+// isEmailValid checks if the email address format is valid
 func (m *Mail) isEmailValid(email string) bool {
 	regex := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
 	return regexp.MustCompile(regex).MatchString(email)
 }
 
+// getTimeout returns the timeout duration with a default of 5 seconds
 func (m *Mail) getTimeout() time.Duration {
 	if m.Timeout == 0 {
-		return 15
+		return 5 * time.Second
 	}
 	return m.Timeout
 }
 
+// getKeepAlive returns the keep-alive duration with a default of 10 seconds
 func (m *Mail) getKeepAlive() time.Duration {
 	if m.KeepAlive == 0 {
-		return 30
+		return 10 * time.Second
 	}
 	return m.KeepAlive
+}
+
+// SendAsync sends the email asynchronously and returns a channel for the result
+func (m *Mail) SendAsync() chan error {
+	result := make(chan error, 1)
+	go func() {
+		result <- m.Send()
+		close(result)
+	}()
+	return result
+}
+
+// SetStreamAttachment sets streaming attachments for the email
+func (m *Mail) SetStreamAttachment(attachments []AttachmentReader) *Mail {
+	m.streamAttachments = attachments
+	return m
+}
+
+// SetTLSConfig sets the TLS configuration
+func (m *Mail) SetTLSConfig(config *TLSConfig) *Mail {
+	m.tlsConfig = config
+	return m
+}
+
+// RateLimit represents rate limiting configuration
+type RateLimit struct {
+	Enabled   bool
+	PerSecond int
+}
+
+// SetRateLimit configures rate limiting
+func (m *Mail) SetRateLimit(limit *RateLimit) *Mail {
+	if limit != nil && limit.Enabled {
+		interval := time.Second / time.Duration(limit.PerSecond)
+		m.rateLimiter = time.NewTicker(interval)
+	} else {
+		if m.rateLimiter != nil {
+			m.rateLimiter.Stop()
+			m.rateLimiter = nil
+		}
+	}
+	return m
+}
+
+// SetTemplateEngine configures the template engine
+func (m *Mail) SetTemplateEngine(engine *TemplateEngine) *Mail {
+	m.TemplateEngine = engine
+	return m
+}
+
+// SetContentType sets the content type of the email
+func (m *Mail) SetContentType(contentType ContentType) *Mail {
+	m.ContentType = contentType
+	return m
+}
+
+// RenderTemplate renders a template with the given data
+func (m *Mail) RenderTemplate(name string, data any) error {
+	if m.TemplateEngine == nil {
+		return errors.New("template engine not configured")
+	}
+
+	m.templateMutex.RLock()
+	tmpl, exists := m.templateCache[name]
+	m.templateMutex.RUnlock()
+
+	if !exists {
+		// Load and cache template
+		filePath := filepath.Join(m.TemplateEngine.BaseDir, name+m.TemplateEngine.DefaultExt)
+		var err error
+		tmpl, err = template.New(name).
+			Funcs(m.TemplateEngine.FuncMap).
+			ParseFiles(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to parse template: %v", err)
+		}
+
+		m.templateMutex.Lock()
+		if m.templateCache == nil {
+			m.templateCache = make(map[string]*template.Template)
+		}
+		m.templateCache[name] = tmpl
+		m.templateMutex.Unlock()
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return fmt.Errorf("failed to execute template: %v", err)
+	}
+
+	m.Content = buf.String()
+	return nil
+}
+
+// PreviewEmail returns a preview of the email content
+func (m *Mail) PreviewEmail() (string, error) {
+	if !m.validate() {
+		return "", errors.New("missing parameter")
+	}
+
+	var preview strings.Builder
+	preview.WriteString(fmt.Sprintf("From: %s <%s>\n", m.Name, m.From))
+	preview.WriteString(fmt.Sprintf("To: %s\n", strings.Join(m.To, ", ")))
+	if len(m.Cc) > 0 {
+		preview.WriteString(fmt.Sprintf("Cc: %s\n", strings.Join(m.Cc, ", ")))
+	}
+	if len(m.Bcc) > 0 {
+		preview.WriteString(fmt.Sprintf("Bcc: %s\n", strings.Join(m.Bcc, ", ")))
+	}
+	preview.WriteString(fmt.Sprintf("Subject: %s\n\n", m.Subject))
+	preview.WriteString(m.Content)
+
+	return preview.String(), nil
 }
