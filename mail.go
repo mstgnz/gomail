@@ -362,6 +362,14 @@ type RateLimit struct {
 // SetRateLimit configures rate limiting
 func (m *Mail) SetRateLimit(limit *RateLimit) *Mail {
 	if limit != nil && limit.Enabled {
+		if limit.PerSecond <= 0 {
+			// Invalid rate limit, disable it
+			if m.rateLimiter != nil {
+				m.rateLimiter.Stop()
+				m.rateLimiter = nil
+			}
+			return m
+		}
 		interval := time.Second / time.Duration(limit.PerSecond)
 		m.rateLimiter = time.NewTicker(interval)
 	} else {

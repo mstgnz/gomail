@@ -47,6 +47,10 @@ func NewPool(config *Mail, size int) (*Pool, error) {
 
 // Create a new connection
 func (p *Pool) createConnection() (*smtp.Client, error) {
+	if p == nil || p.config == nil {
+		return nil, fmt.Errorf("pool or config is not initialized")
+	}
+
 	addr := fmt.Sprintf("%s:%s", p.config.Host, p.config.Port)
 
 	dialer := &net.Dialer{
@@ -103,8 +107,15 @@ func (p *Pool) createConnection() (*smtp.Client, error) {
 
 // Get a connection from the pool
 func (p *Pool) getConnection() (*smtp.Client, error) {
+	if p == nil || p.connections == nil {
+		return nil, fmt.Errorf("pool is not initialized")
+	}
+
 	select {
 	case client := <-p.connections:
+		if client == nil {
+			return p.createConnection()
+		}
 		return client, nil
 	default:
 		return p.createConnection()
@@ -113,6 +124,10 @@ func (p *Pool) getConnection() (*smtp.Client, error) {
 
 // Release a connection back to the pool
 func (p *Pool) releaseConnection(client *smtp.Client) {
+	if client == nil {
+		return
+	}
+
 	select {
 	case p.connections <- client:
 	default:
@@ -122,11 +137,17 @@ func (p *Pool) releaseConnection(client *smtp.Client) {
 
 // Close the pool and all its connections
 func (p *Pool) Close() {
+	if p == nil || p.connections == nil {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	close(p.connections)
 	for client := range p.connections {
-		client.Close()
+		if client != nil {
+			client.Close()
+		}
 	}
 }

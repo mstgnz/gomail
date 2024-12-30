@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"text/template"
 	"time"
@@ -852,5 +853,380 @@ func TestStreamingAttachments(t *testing.T) {
 
 	if err := m.Send(); err != nil {
 		t.Errorf("Send() with streaming attachment error = %v", err)
+	}
+}
+
+func TestContentType(t *testing.T) {
+	m := &Mail{}
+
+	tests := []struct {
+		name        string
+		contentType ContentType
+	}{
+		{"Plain Text", TextPlain},
+		{"HTML", TextHTML},
+		{"Markdown", TextMarkdown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.SetContentType(tt.contentType)
+			if m.ContentType != tt.contentType {
+				t.Errorf("SetContentType() = %v, want %v", m.ContentType, tt.contentType)
+			}
+		})
+	}
+}
+
+func TestSendHtmlWithInvalidTemplate(t *testing.T) {
+	m := &Mail{
+		From:    "sender@example.com",
+		Name:    "Test Sender",
+		Host:    "smtp.example.com",
+		Port:    "587",
+		User:    "user",
+		Pass:    "pass",
+		Subject: "Test Subject",
+		To:      []string{"recipient@example.com"},
+	}
+
+	// Test with non-existent template
+	err := m.SendHtml("nonexistent.html", nil)
+	if err == nil {
+		t.Error("SendHtml() with invalid template should return error")
+	}
+
+	// Test with invalid template data
+	tmpFile, err := os.CreateTemp("", "test-*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	invalidTemplate := `<html>{{.InvalidField}}</html>`
+	if err := os.WriteFile(tmpFile.Name(), []byte(invalidTemplate), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.SendHtml(tmpFile.Name(), map[string]any{"Name": "John"})
+	if err == nil {
+		t.Error("SendHtml() with invalid template data should return error")
+	}
+}
+
+func TestConnectionPoolEdgeCases(t *testing.T) {
+	server := newMockSMTPServer(t)
+	defer server.close()
+
+	host, port, _ := net.SplitHostPort(server.addr())
+
+	tests := []struct {
+		name     string
+		poolSize int
+		wantErr  bool
+	}{
+		{"Zero pool size", 0, false},
+		{"Negative pool size", -1, false},
+		{"Very large pool size", 1000, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Mail{
+				From:    "sender@example.com",
+				Name:    "Test Sender",
+				Host:    host,
+				Port:    port,
+				User:    "user",
+				Pass:    "pass",
+				Subject: "Test Subject",
+				Content: "Test Content",
+				To:      []string{"recipient@example.com"},
+			}
+
+			pool, err := NewPool(m, tt.poolSize)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("NewPool() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if pool != nil {
+				defer pool.Close()
+
+				// Test multiple connections
+				for i := 0; i < 3; i++ {
+					conn, err := pool.getConnection()
+					if err != nil {
+						t.Errorf("getConnection() error = %v", err)
+						continue
+					}
+					if conn != nil {
+						pool.releaseConnection(conn)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPoolConnectionManagement(t *testing.T) {
+	server := newMockSMTPServer(t)
+	defer server.close()
+
+	host, port, _ := net.SplitHostPort(server.addr())
+
+	m := &Mail{
+		From:    "sender@example.com",
+		Name:    "Test Sender",
+		Host:    host,
+		Port:    port,
+		User:    "user",
+		Pass:    "pass",
+		Subject: "Test Subject",
+		Content: "Test Content",
+		To:      []string{"recipient@example.com"},
+	}
+
+	pool, err := NewPool(m, 5)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Close()
+
+	// Test safe release of nil connection
+	pool.releaseConnection(nil)
+
+	// Test concurrent connection acquisition and release
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := pool.getConnection()
+			if err != nil {
+				t.Errorf("getConnection() error = %v", err)
+				return
+			}
+			if conn != nil {
+				time.Sleep(10 * time.Millisecond)
+				pool.releaseConnection(conn)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRateLimitingEdgeCases(t *testing.T) {
+	m := &Mail{}
+
+	tests := []struct {
+		name      string
+		rateLimit *RateLimit
+	}{
+		{"Nil rate limit", nil},
+		{"Zero per second", &RateLimit{Enabled: true, PerSecond: 0}},
+		{"Negative per second", &RateLimit{Enabled: true, PerSecond: -1}},
+		{"Disabled rate limit", &RateLimit{Enabled: false, PerSecond: 10}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.SetRateLimit(tt.rateLimit)
+			// Verify that setting invalid rate limits doesn't panic
+			if tt.rateLimit == nil && m.rateLimiter != nil {
+				t.Error("rateLimiter should be nil for nil RateLimit")
+			}
+		})
+	}
+}
+
+func TestSendEdgeCases(t *testing.T) {
+	server := newMockSMTPServer(t)
+	defer server.close()
+
+	host, port, _ := net.SplitHostPort(server.addr())
+
+	tests := []struct {
+		name    string
+		setup   func() *Mail
+		wantErr bool
+	}{
+		{
+			name: "with rate limiter",
+			setup: func() *Mail {
+				m := &Mail{
+					From:    "sender@example.com",
+					Name:    "Test Sender",
+					Host:    host,
+					Port:    port,
+					User:    "user",
+					Pass:    "pass",
+					Subject: "Test Subject",
+					Content: "Test Content",
+					To:      []string{"recipient@example.com"},
+				}
+				m.SetRateLimit(&RateLimit{Enabled: true, PerSecond: 1})
+				return m
+			},
+			wantErr: false,
+		},
+		{
+			name: "with attachments and rate limiter",
+			setup: func() *Mail {
+				m := &Mail{
+					From:    "sender@example.com",
+					Name:    "Test Sender",
+					Host:    host,
+					Port:    port,
+					User:    "user",
+					Pass:    "pass",
+					Subject: "Test Subject",
+					Content: "Test Content",
+					To:      []string{"recipient@example.com"},
+				}
+				m.SetRateLimit(&RateLimit{Enabled: true, PerSecond: 1})
+				m.SetAttachment(map[string][]byte{"test.txt": []byte("test")})
+				return m
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := tt.setup()
+			err := m.send()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("send() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCreateConnectionEdgeCases(t *testing.T) {
+	server := newMockSMTPServer(t)
+	defer server.close()
+
+	host, port, _ := net.SplitHostPort(server.addr())
+
+	tests := []struct {
+		name    string
+		setup   func() *Mail
+		wantErr bool
+	}{
+		{
+			name: "with custom timeouts",
+			setup: func() *Mail {
+				m := &Mail{
+					From:    "sender@example.com",
+					Name:    "Test Sender",
+					Host:    host,
+					Port:    port,
+					User:    "user",
+					Pass:    "pass",
+					Subject: "Test Subject",
+					Content: "Test Content",
+					To:      []string{"recipient@example.com"},
+				}
+				m.SetTimeout(5 * time.Second)
+				m.SetKeepAlive(10 * time.Second)
+				return m
+			},
+			wantErr: false,
+		},
+		{
+			name: "with invalid host",
+			setup: func() *Mail {
+				m := &Mail{
+					From:    "sender@example.com",
+					Name:    "Test Sender",
+					Host:    "invalid.host",
+					Port:    "587",
+					User:    "user",
+					Pass:    "pass",
+					Subject: "Test Subject",
+					Content: "Test Content",
+					To:      []string{"recipient@example.com"},
+				}
+				return m
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := tt.setup()
+			pool, err := NewPool(m, 1)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("NewPool() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if pool != nil {
+				defer pool.Close()
+			}
+		})
+	}
+}
+
+func TestRateLimitingComprehensive(t *testing.T) {
+	m := &Mail{}
+
+	tests := []struct {
+		name      string
+		rateLimit *RateLimit
+		check     func(*testing.T, *Mail)
+	}{
+		{
+			name:      "nil rate limit",
+			rateLimit: nil,
+			check: func(t *testing.T, m *Mail) {
+				if m.rateLimiter != nil {
+					t.Error("rateLimiter should be nil")
+				}
+			},
+		},
+		{
+			name: "disabled rate limit",
+			rateLimit: &RateLimit{
+				Enabled:   false,
+				PerSecond: 10,
+			},
+			check: func(t *testing.T, m *Mail) {
+				if m.rateLimiter != nil {
+					t.Error("rateLimiter should be nil when disabled")
+				}
+			},
+		},
+		{
+			name: "valid rate limit",
+			rateLimit: &RateLimit{
+				Enabled:   true,
+				PerSecond: 10,
+			},
+			check: func(t *testing.T, m *Mail) {
+				if m.rateLimiter == nil {
+					t.Error("rateLimiter should not be nil")
+				}
+			},
+		},
+		{
+			name: "update existing rate limit",
+			rateLimit: &RateLimit{
+				Enabled:   true,
+				PerSecond: 20,
+			},
+			check: func(t *testing.T, m *Mail) {
+				if m.rateLimiter == nil {
+					t.Error("rateLimiter should not be nil")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.SetRateLimit(tt.rateLimit)
+			tt.check(t, m)
+		})
 	}
 }
