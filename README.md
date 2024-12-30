@@ -8,6 +8,20 @@ To use the package, you need to have Go installed and Go modules enabled in your
 go get -u github.com/mstgnz/gomail
 ```
 
+## Features
+- SMTP protocol support
+- Connection pooling for performance optimization
+- HTML template support with custom functions
+- File attachments (regular and streaming)
+- Asynchronous email sending
+- Rate limiting
+- TLS support (STARTTLS and Direct TLS)
+- CC and BCC recipients
+- Email preview
+- Configurable timeouts and keep-alive
+- Template caching
+- Comprehensive error handling
+
 ## Benchmarks
 Performance benchmarks on Apple M1:
 
@@ -55,17 +69,6 @@ func main() {
     if err != nil {
         // Handle error
     }
-
-    // Send an email with HTML template
-    err = mail.SetSubject("Test Email").
-        SetTo("recipient@example.com").
-        SendHtml("templates/welcome.html", map[string]any{
-            "Name": "John",
-            "URL":  "https://example.com",
-        })
-    if err != nil {
-        // Handle error
-    }
 }
 ```
 
@@ -84,6 +87,77 @@ mail := &Mail{
 
 // Set connection pool size (default: 10)
 mail.SetPoolSize(20)
+```
+
+### HTML Templates with Custom Functions
+```go
+// Configure template engine
+engine := &TemplateEngine{
+    BaseDir:    "templates",
+    DefaultExt: ".html",
+    FuncMap: template.FuncMap{
+        "upper": strings.ToUpper,
+        "formatDate": func(t time.Time) string {
+            return t.Format("2006-01-02")
+        },
+    },
+}
+mail.SetTemplateEngine(engine)
+
+// Render template with data
+data := map[string]any{
+    "Name": "John",
+    "Date": time.Now(),
+}
+err := mail.RenderTemplate("welcome", data)
+```
+
+Example template (templates/welcome.html):
+```html
+<html>
+<body>
+    <h1>Welcome {{.Name}}!</h1>
+    <p>Today is {{formatDate .Date}}</p>
+    <p>Your name in uppercase: {{upper .Name}}</p>
+</body>
+</html>
+```
+
+### TLS Configuration
+```go
+// STARTTLS configuration
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           true,
+    InsecureSkipVerify: false,
+    ServerName:         "smtp.example.com",
+})
+
+// Direct TLS configuration
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           false,
+    InsecureSkipVerify: false,
+    ServerName:         "smtp.example.com",
+})
+```
+
+### Rate Limiting
+```go
+// Limit to 10 emails per second
+mail.SetRateLimit(&RateLimit{
+    Enabled:   true,
+    PerSecond: 10,
+})
+
+// Send multiple emails with rate limiting
+for i := 0; i < 100; i++ {
+    err := mail.SetSubject(fmt.Sprintf("Email %d", i)).
+        SetContent("Rate limited email").
+        SetTo("recipient@example.com").
+        Send()
+    if err != nil {
+        log.Printf("Failed to send email %d: %v", i, err)
+    }
+}
 ```
 
 ### Asynchronous Email Sending
@@ -122,46 +196,11 @@ attachments := []AttachmentReader{
     },
 }
 
-err = mail.SetSubject("Test Email with Large Attachment").
-    SetContent("This is a test email with a large attachment.").
+err = mail.SetSubject("Email with Large Attachment").
+    SetContent("Please find the attached file.").
     SetTo("recipient@example.com").
     SetStreamAttachment(attachments).
     Send()
-```
-
-### Rate Limiting
-```go
-// Configure rate limiting
-mail.SetRateLimit(&RateLimit{
-    Enabled:   true,
-    PerSecond: 2, // 2 emails per second
-})
-```
-
-### TLS Configuration
-```go
-// Configure TLS settings
-mail.SetTLSConfig(&TLSConfig{
-    StartTLS:           true,
-    InsecureSkipVerify: false,
-    ServerName:         "smtp.example.com",
-})
-```
-
-### Template Engine with Custom Functions
-```go
-// Configure template engine
-engine := &TemplateEngine{
-    BaseDir:    "templates",
-    DefaultExt: ".html",
-    FuncMap: template.FuncMap{
-        "upper": strings.ToUpper,
-    },
-}
-mail.SetTemplateEngine(engine)
-
-// Render template
-err := mail.RenderTemplate("welcome", data)
 ```
 
 ### Email Preview
@@ -170,23 +209,307 @@ err := mail.RenderTemplate("welcome", data)
 preview, err := mail.PreviewEmail()
 if err != nil {
     log.Printf("Preview error: %v", err)
+    return
 }
+fmt.Println("Email Preview:")
 fmt.Println(preview)
 ```
 
-## Features
-- SMTP protocol support
-- Connection pooling for performance optimization
-- HTML template support with custom functions
-- File attachments (regular and streaming)
-- Asynchronous email sending
-- Rate limiting
-- TLS support (STARTTLS and Direct TLS)
-- CC and BCC recipients
-- Email preview
-- Configurable timeouts and keep-alive
-- Template caching
-- Comprehensive error handling
+### Error Handling
+```go
+// Basic error handling
+err := mail.Send()
+if err != nil {
+    switch {
+    case strings.Contains(err.Error(), "connection refused"):
+        log.Printf("SMTP server is not accessible: %v", err)
+    case strings.Contains(err.Error(), "invalid auth"):
+        log.Printf("Authentication failed: %v", err)
+    case strings.Contains(err.Error(), "invalid recipient"):
+        log.Printf("Invalid recipient address: %v", err)
+    default:
+        log.Printf("Failed to send email: %v", err)
+    }
+}
+
+// Async error handling with timeout
+result := mail.SendAsync()
+select {
+case err := <-result:
+    if err != nil {
+        log.Printf("Failed to send email: %v", err)
+    }
+case <-time.After(30 * time.Second):
+    log.Printf("Email sending timed out")
+}
+```
+
+### Template Usage Examples
+```go
+// 1. Basic Template
+engine := &TemplateEngine{
+    BaseDir:    "templates",
+    DefaultExt: ".html",
+}
+mail.SetTemplateEngine(engine)
+
+// Basic template usage
+data := map[string]any{
+    "Name": "John",
+    "Products": []string{"Product 1", "Product 2"},
+    "Total": 99.99,
+}
+err := mail.RenderTemplate("order-confirmation", data)
+
+// 2. Custom Template Functions
+engine := &TemplateEngine{
+    BaseDir:    "templates",
+    DefaultExt: ".html",
+    FuncMap: template.FuncMap{
+        "upper": strings.ToUpper,
+        "formatDate": func(t time.Time) string {
+            return t.Format("2006-01-02")
+        },
+        "formatPrice": func(price float64) string {
+            return fmt.Sprintf("$%.2f", price)
+        },
+        "safeHTML": func(s string) template.HTML {
+            return template.HTML(s)
+        },
+    },
+}
+mail.SetTemplateEngine(engine)
+
+// 3. Template with Layouts
+// templates/layouts/base.html
+/*
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{.Title}}</title>
+</head>
+<body>
+    <header>{{template "header" .}}</header>
+    <main>{{template "content" .}}</main>
+    <footer>{{template "footer" .}}</footer>
+</body>
+</html>
+*/
+
+// templates/welcome.html
+/*
+{{define "header"}}
+    <h1>Welcome {{.Name}}</h1>
+{{end}}
+
+{{define "content"}}
+    <p>Today is {{formatDate .Date}}</p>
+    <p>Your total: {{formatPrice .Total}}</p>
+{{end}}
+
+{{define "footer"}}
+    <p>Contact us: support@example.com</p>
+{{end}}
+*/
+```
+
+### TLS Configuration Examples
+```go
+// 1. STARTTLS with Gmail
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           true,
+    InsecureSkipVerify: false,
+    ServerName:         "smtp.gmail.com",
+})
+
+// 2. Direct TLS with custom certificates
+cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+if err != nil {
+    log.Fatal(err)
+}
+
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           false,
+    InsecureSkipVerify: false,
+    ServerName:         "smtp.example.com",
+    Certificates:       []tls.Certificate{cert},
+})
+
+// 3. TLS with custom verification
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           true,
+    InsecureSkipVerify: false,
+    ServerName:         "smtp.example.com",
+    MinVersion:         tls.VersionTLS12,
+    MaxVersion:         tls.VersionTLS13,
+})
+
+// 4. Development/Testing TLS (insecure)
+mail.SetTLSConfig(&TLSConfig{
+    StartTLS:           true,
+    InsecureSkipVerify: true, // Only for development!
+    ServerName:         "localhost",
+})
+```
+
+### Rate Limiting Examples
+```go
+// 1. Basic Rate Limiting
+mail.SetRateLimit(&RateLimit{
+    Enabled:   true,
+    PerSecond: 10, // 10 emails per second
+})
+
+// 2. Burst Sending with Rate Limiting
+emails := []struct {
+    to      string
+    subject string
+    content string
+}{
+    {"user1@example.com", "Subject 1", "Content 1"},
+    {"user2@example.com", "Subject 2", "Content 2"},
+    // ... more emails
+}
+
+// Configure rate limiting
+mail.SetRateLimit(&RateLimit{
+    Enabled:   true,
+    PerSecond: 5, // 5 emails per second
+})
+
+// Send emails with progress tracking
+for i, email := range emails {
+    err := mail.SetSubject(email.subject).
+        SetContent(email.content).
+        SetTo(email.to).
+        Send()
+    
+    if err != nil {
+        log.Printf("Failed to send email %d: %v", i+1, err)
+        continue
+    }
+    
+    log.Printf("Progress: %d/%d emails sent", i+1, len(emails))
+}
+
+// 3. Async Sending with Rate Limiting
+results := make(chan error, len(emails))
+for _, email := range emails {
+    go func(e struct {
+        to      string
+        subject string
+        content string
+    }) {
+        results <- mail.SetSubject(e.subject).
+            SetContent(e.content).
+            SetTo(e.to).
+            Send()
+    }(email)
+}
+
+// Collect results
+for i := 0; i < len(emails); i++ {
+    if err := <-results; err != nil {
+        log.Printf("Email error: %v", err)
+    }
+}
+```
+
+### Error Handling Examples
+```go
+// 1. Comprehensive Error Handling
+err := mail.Send()
+if err != nil {
+    switch {
+    case strings.Contains(err.Error(), "connection refused"):
+        log.Printf("SMTP server is not accessible: %v", err)
+        // Retry with backup server
+        mail.SetHost("backup-smtp.example.com")
+        err = mail.Send()
+        
+    case strings.Contains(err.Error(), "invalid auth"):
+        log.Printf("Authentication failed: %v", err)
+        // Refresh credentials and retry
+        mail.SetUser("new-user").SetPass("new-pass")
+        err = mail.Send()
+        
+    case strings.Contains(err.Error(), "invalid recipient"):
+        log.Printf("Invalid recipient address: %v", err)
+        // Log invalid address for cleanup
+        logInvalidAddress(mail.To[0])
+        
+    case strings.Contains(err.Error(), "timeout"):
+        log.Printf("Connection timeout: %v", err)
+        // Retry with increased timeout
+        mail.SetTimeout(30 * time.Second)
+        err = mail.Send()
+        
+    default:
+        log.Printf("Unexpected error: %v", err)
+    }
+}
+
+// 2. Retry Logic
+maxRetries := 3
+retryDelay := time.Second
+
+for i := 0; i < maxRetries; i++ {
+    err := mail.Send()
+    if err == nil {
+        break
+    }
+    
+    log.Printf("Attempt %d failed: %v", i+1, err)
+    if i < maxRetries-1 {
+        time.Sleep(retryDelay * time.Duration(i+1))
+    }
+}
+
+// 3. Async Error Handling with Context
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+result := mail.SendAsync()
+select {
+case err := <-result:
+    if err != nil {
+        log.Printf("Failed to send email: %v", err)
+    }
+case <-ctx.Done():
+    log.Printf("Email sending timed out or cancelled")
+case <-time.After(5 * time.Second):
+    log.Printf("Email sending took too long")
+}
+
+// 4. Batch Error Handling
+type EmailResult struct {
+    To    string
+    Error error
+}
+
+results := make(chan EmailResult, len(recipients))
+for _, to := range recipients {
+    go func(recipient string) {
+        err := mail.SetTo(recipient).Send()
+        results <- EmailResult{To: recipient, Error: err}
+    }(to)
+}
+
+// Process results
+successCount := 0
+failureCount := 0
+for i := 0; i < len(recipients); i++ {
+    result := <-results
+    if result.Error != nil {
+        failureCount++
+        log.Printf("Failed to send to %s: %v", result.To, result.Error)
+    } else {
+        successCount++
+    }
+}
+
+log.Printf("Sending complete: %d successful, %d failed", successCount, failureCount)
+```
 
 ## Contributing
 Contributions are welcome! For any feedback, bug reports, or contributions, please submit an issue or pull request to the GitHub repository.
