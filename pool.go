@@ -51,7 +51,7 @@ func (p *Pool) createConnection() (*smtp.Client, error) {
 		return nil, fmt.Errorf("pool or config is not initialized")
 	}
 
-	addr := fmt.Sprintf("%s:%s", p.config.Host, p.config.Port)
+	addr := net.JoinHostPort(p.config.Host, p.config.Port)
 
 	dialer := &net.Dialer{
 		Timeout:   p.config.getTimeout(),

@@ -146,7 +146,34 @@ func (m *Mail) SendHtml(filePath string, data map[string]any) error {
 		return err
 	}
 	m.Content = content
-	return m.send()
+	return m.SendWithRetry(3) // Use retry mechanism with 3 attempts
+}
+
+// SendWithRetry sends the email with retry mechanism
+func (m *Mail) SendWithRetry(maxRetries int) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := m.send()
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("Email sent successfully on attempt %d", attempt)
+			}
+			return nil
+		}
+
+		lastErr = err
+		log.Printf("Email send attempt %d failed: %v", attempt, err)
+
+		if attempt < maxRetries {
+			// Exponential backoff: wait 2^attempt seconds
+			waitTime := time.Duration(1<<uint(attempt)) * time.Second
+			log.Printf("Waiting %v before retry...", waitTime)
+			time.Sleep(waitTime)
+		}
+	}
+
+	return fmt.Errorf("failed to send email after %d attempts, last error: %v", maxRetries, lastErr)
 }
 
 // Send sends the email
