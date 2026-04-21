@@ -336,10 +336,11 @@ func (m *Mail) validate() bool {
 	return true
 }
 
+var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
 // isEmailValid checks if the email address format is valid
 func (m *Mail) isEmailValid(email string) bool {
-	regex := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
-	return regexp.MustCompile(regex).MatchString(email)
+	return emailRegex.MatchString(email)
 }
 
 // getTimeout returns the timeout duration with a default of 5 seconds
@@ -398,6 +399,9 @@ func (m *Mail) SetRateLimit(limit *RateLimit) *Mail {
 			return m
 		}
 		interval := time.Second / time.Duration(limit.PerSecond)
+		if m.rateLimiter != nil {
+			m.rateLimiter.Stop()
+		}
 		m.rateLimiter = time.NewTicker(interval)
 	} else {
 		if m.rateLimiter != nil {
@@ -456,6 +460,19 @@ func (m *Mail) RenderTemplate(name string, data any) error {
 
 	m.Content = buf.String()
 	return nil
+}
+
+// Close releases all resources held by the Mail instance (pool connections, rate limiter).
+// Call this when the Mail instance is no longer needed.
+func (m *Mail) Close() {
+	if m.rateLimiter != nil {
+		m.rateLimiter.Stop()
+		m.rateLimiter = nil
+	}
+	if m.pool != nil {
+		m.pool.Close()
+		m.pool = nil
+	}
 }
 
 // PreviewEmail returns a preview of the email content

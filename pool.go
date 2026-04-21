@@ -128,14 +128,23 @@ func (p *Pool) releaseConnection(client *smtp.Client) {
 		return
 	}
 
+	p.mu.Lock()
+	ch := p.connections
+	p.mu.Unlock()
+
+	if ch == nil {
+		client.Close()
+		return
+	}
+
 	select {
-	case p.connections <- client:
+	case ch <- client:
 	default:
 		client.Close()
 	}
 }
 
-// Close the pool and all its connections
+// Close drains and closes all connections in the pool.
 func (p *Pool) Close() {
 	if p == nil || p.connections == nil {
 		return
@@ -144,10 +153,17 @@ func (p *Pool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	close(p.connections)
-	for client := range p.connections {
-		if client != nil {
-			client.Close()
+	// Drain the channel before closing to avoid panic on concurrent releaseConnection.
+	for {
+		select {
+		case client := <-p.connections:
+			if client != nil {
+				client.Close()
+			}
+		default:
+			close(p.connections)
+			p.connections = nil
+			return
 		}
 	}
 }

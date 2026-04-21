@@ -403,11 +403,12 @@ func TestEmailContentAndHeaders(t *testing.T) {
 	// Wait for message processing
 	time.Sleep(100 * time.Millisecond)
 
-	if len(server.messages) == 0 {
+	msgs := server.getMessages()
+	if len(msgs) == 0 {
 		t.Fatal("No messages received")
 	}
 
-	msg := server.messages[0]
+	msg := msgs[0]
 	expectedHeaders := []string{
 		"From: Test Sender <sender@example.com>",
 		"To: recipient@example.com",
