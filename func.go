@@ -2,11 +2,12 @@ package gomail
 
 import (
 	"bytes"
+	"html/template"
 	"os"
-	"text/template"
 )
 
-// SimpleRenderTemplate renders a simple HTML template with dynamic data
+// SimpleRenderTemplate renders an HTML template file with data. It uses html/template, so
+// data is HTML-escaped; wrap trusted markup in template.HTML.
 func SimpleRenderTemplate(filePath string, data map[string]any) (string, error) {
 	fileContent, err := os.ReadFile(filePath)
 	if err != nil {

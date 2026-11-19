@@ -2,6 +2,7 @@ package gomail
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -366,7 +367,7 @@ func TestPoolOperations(t *testing.T) {
 			}
 
 			// Test connection acquisition and release
-			client, err := pool.getConnection()
+			client, err := pool.getConnection(context.Background())
 			if err != nil {
 				t.Fatalf("getConnection() error = %v", err)
 			}
@@ -400,9 +401,6 @@ func TestEmailContentAndHeaders(t *testing.T) {
 		t.Fatalf("Send() error = %v", err)
 	}
 
-	// Wait for message processing
-	time.Sleep(100 * time.Millisecond)
-
 	msgs := server.getMessages()
 	if len(msgs) == 0 {
 		t.Fatal("No messages received")
@@ -410,9 +408,9 @@ func TestEmailContentAndHeaders(t *testing.T) {
 
 	msg := msgs[0]
 	expectedHeaders := []string{
-		"From: Test Sender <sender@example.com>",
-		"To: recipient@example.com",
-		"Cc: cc@example.com",
+		`From: "Test Sender" <sender@example.com>`,
+		"To: <recipient@example.com>",
+		"Cc: <cc@example.com>",
 		"Subject: Test Subject",
 		"MIME-Version: 1.0",
 		"Content-Type: multipart/mixed;",
@@ -447,8 +445,7 @@ func BenchmarkMailSend(b *testing.B) {
 		To:      []string{"recipient@example.com"},
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := m.Send()
 		if err != nil {
 			b.Fatalf("Send() error = %v", err)
@@ -480,8 +477,7 @@ func BenchmarkMailSendWithAttachments(b *testing.B) {
 		Attachments: attachments,
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := m.Send()
 		if err != nil {
 			b.Fatalf("Send() error = %v", err)
@@ -507,8 +503,7 @@ func BenchmarkMailSendAsync(b *testing.B) {
 		To:      []string{"recipient@example.com"},
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		result := m.SendAsync()
 		if err := <-result; err != nil {
 			b.Fatalf("SendAsync() error = %v", err)
@@ -528,7 +523,7 @@ func TestErrorCases(t *testing.T) {
 				return &Mail{
 					From:    "sender@example.com",
 					Name:    "Test Sender",
-					Host:    "invalid.host",
+					Host:    "host.invalid",
 					Port:    "587",
 					User:    "user",
 					Pass:    "pass",
@@ -621,7 +616,7 @@ func TestPoolConcurrency(t *testing.T) {
 
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			client, err := pool.getConnection()
+			client, err := pool.getConnection(context.Background())
 			if err != nil {
 				errChan <- err
 				return
@@ -641,56 +636,6 @@ func TestPoolConcurrency(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Error("Timeout waiting for concurrent operations")
 		}
-	}
-}
-
-func TestTLSConfiguration(t *testing.T) {
-	tests := []struct {
-		name      string
-		tlsConfig *TLSConfig
-		wantErr   bool
-	}{
-		{
-			name: "STARTTLS configuration",
-			tlsConfig: &TLSConfig{
-				StartTLS:           true,
-				InsecureSkipVerify: true,
-				ServerName:         "localhost",
-			},
-			wantErr: false,
-		},
-		{
-			name: "Direct TLS configuration",
-			tlsConfig: &TLSConfig{
-				StartTLS:           false,
-				InsecureSkipVerify: true,
-				ServerName:         "localhost",
-			},
-			wantErr: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := &Mail{
-				From:      "sender@example.com",
-				Name:      "Test Sender",
-				Host:      "localhost",
-				Port:      "587",
-				User:      "user",
-				Pass:      "pass",
-				Subject:   "Test Subject",
-				Content:   "Test Content",
-				To:        []string{"recipient@example.com"},
-				Timeout:   5 * time.Second,
-				KeepAlive: 10 * time.Second,
-			}
-
-			m.SetTLSConfig(tt.tlsConfig)
-
-			// TLS testi için skip
-			t.Skip("TLS tests are skipped in local environment")
-		})
 	}
 }
 
@@ -762,13 +707,33 @@ func TestTemplateEngineAndContentTypes(t *testing.T) {
 	}
 
 	if err := m.RenderTemplate("welcome", data); err != nil {
-		t.Skip("Template tests are skipped in local environment")
-		return
+		t.Fatalf("RenderTemplate() error = %v", err)
 	}
 
 	expectedContent := "<html><body>Hello John!</body></html>"
 	if m.Content != expectedContent {
-		t.Skip("Template tests are skipped in local environment")
+		t.Errorf("RenderTemplate() content = %q, want %q", m.Content, expectedContent)
+	}
+
+	// Cached second render with hostile data: html/template escapes it.
+	if err := m.RenderTemplate("welcome", map[string]any{"Name": `<a href="https://evil.example">x</a>`}); err != nil {
+		t.Fatalf("RenderTemplate() cached error = %v", err)
+	}
+	if strings.Contains(m.Content, "<a href") {
+		t.Errorf("RenderTemplate() did not escape data: %q", m.Content)
+	}
+
+	// welcome.html exists one level up; a name must not reach it.
+	sub := filepath.Join(tmpDir, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jailed := &Mail{TemplateEngine: &TemplateEngine{BaseDir: sub, DefaultExt: ".html"}}
+	if err := jailed.RenderTemplate("../welcome", data); err == nil {
+		t.Error("RenderTemplate() accepted a name outside BaseDir")
+	}
+	if err := (&Mail{}).RenderTemplate("welcome", data); err == nil {
+		t.Error("RenderTemplate() without an engine should fail")
 	}
 }
 
@@ -904,14 +869,19 @@ func TestSendHtmlWithInvalidTemplate(t *testing.T) {
 	}
 	defer os.Remove(tmpFile.Name())
 
-	invalidTemplate := `<html>{{.InvalidField}}</html>`
+	// A field of a string fails at execute time, before any network use.
+	invalidTemplate := `<html>{{.Name.Missing}}</html>`
 	if err := os.WriteFile(tmpFile.Name(), []byte(invalidTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
 
+	start := time.Now()
 	err = m.SendHtml(tmpFile.Name(), map[string]any{"Name": "John"})
-	if err == nil {
-		t.Error("SendHtml() with invalid template data should return error")
+	if err == nil || !strings.Contains(err.Error(), "Missing") {
+		t.Errorf("SendHtml() with invalid template data error = %v, want a template error", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("SendHtml() took %v; a template error must not reach the network", elapsed)
 	}
 }
 
@@ -955,7 +925,7 @@ func TestConnectionPoolEdgeCases(t *testing.T) {
 
 				// Test multiple connections
 				for i := 0; i < 3; i++ {
-					conn, err := pool.getConnection()
+					conn, err := pool.getConnection(context.Background())
 					if err != nil {
 						t.Errorf("getConnection() error = %v", err)
 						continue
@@ -1002,7 +972,7 @@ func TestPoolConnectionManagement(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conn, err := pool.getConnection()
+			conn, err := pool.getConnection(context.Background())
 			if err != nil {
 				t.Errorf("getConnection() error = %v", err)
 				return
@@ -1095,9 +1065,9 @@ func TestSendEdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := tt.setup()
-			err := m.send()
+			err := m.Send()
 			if (err != nil) != tt.wantErr {
-				t.Errorf("send() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("Send() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -1140,7 +1110,7 @@ func TestCreateConnectionEdgeCases(t *testing.T) {
 				m := &Mail{
 					From:    "sender@example.com",
 					Name:    "Test Sender",
-					Host:    "invalid.host",
+					Host:    "host.invalid",
 					Port:    "587",
 					User:    "user",
 					Pass:    "pass",
@@ -1157,14 +1127,17 @@ func TestCreateConnectionEdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := tt.setup()
+			// NewPool is lazy: the dial happens on the first getConnection.
 			pool, err := NewPool(m, 1)
+			if err != nil {
+				t.Fatalf("NewPool() error = %v", err)
+			}
+			defer pool.Close()
+			pc, err := pool.getConnection(context.Background())
 			if (err != nil) != tt.wantErr {
-				t.Errorf("NewPool() error = %v, wantErr %v", err, tt.wantErr)
-				return
+				t.Errorf("getConnection() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			if pool != nil {
-				defer pool.Close()
-			}
+			pool.releaseConnection(pc)
 		})
 	}
 }

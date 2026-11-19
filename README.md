@@ -9,38 +9,33 @@ go get -u github.com/mstgnz/gomail
 ```
 
 ## Features
-- SMTP protocol support
-- Connection pooling for performance optimization
-- HTML template support with custom functions
+- SMTP protocol support, no dependencies outside the standard library
+- `SendContext`: deadlines and cancellation on the SMTP connection
+- A rejected message is an error: the server's answer to the message (250 or 4xx/5xx) is returned
+- Connection pooling with health checks: idle connections are checked with NOOP and replaced when dead
+- UTF-8 everywhere: Subject and sender name are RFC 2047 encoded, attachment names RFC 2231,
+  bodies quoted-printable, so Turkish and other non-ASCII text arrive intact
+- Header injection protection: CR or LF in a header value is refused
+- Bcc recipients never appear in the message headers
+- Date and Message-ID headers
+- HTML templates with automatic escaping (`html/template`) and custom functions
+- Optional plain-text alternative (`multipart/alternative`)
 - File attachments (regular and streaming)
-- Asynchronous email sending
+- Asynchronous sending and retries with backoff
 - Rate limiting
-- TLS support (STARTTLS and Direct TLS)
-- CC and BCC recipients
-- Email preview
-- Configurable timeouts and keep-alive
-- Template caching
-- Comprehensive error handling
+- TLS (STARTTLS and direct TLS) with certificate verification on by default
+- No logging: every failure is returned as an error
 
 ## Benchmarks
-Performance benchmarks on Apple M1:
+Against the in-process test server, Apple M2 Max:
 
 ```
-BenchmarkMailSend-8                    13111    83133 ns/op    14435 B/op    184 allocs/op
-BenchmarkMailSendWithAttachments-8     13074    87134 ns/op    19552 B/op    234 allocs/op
-BenchmarkMailSendAsync-8               12862    92055 ns/op    14660 B/op    187 allocs/op
+BenchmarkMailSend-12                    8569    138486 ns/op     7831 B/op    100 allocs/op
+BenchmarkMailSendWithAttachments-12     7903    161349 ns/op    14048 B/op    172 allocs/op
+BenchmarkMailSendAsync-12               8478    176748 ns/op     7999 B/op    103 allocs/op
 ```
 
-- `MailSend`: Basic email sending without attachments
-- `MailSendWithAttachments`: Email sending with file attachments
-- `MailSendAsync`: Asynchronous email sending
-
-The benchmarks show that:
-- Basic email sending takes ~83μs per operation
-- Adding attachments increases memory allocation by ~35% but only adds ~4μs to operation time
-- Async sending has minimal overhead (~9μs) compared to synchronous sending
-
-All operations maintain efficient memory usage with relatively low allocations.
+Each send includes the NOOP check of the pooled connection, one extra round trip.
 
 ## Basic Usage
 ```go
@@ -52,7 +47,7 @@ import (
 
 func main() {
     // Create a Mail struct and set the necessary fields
-    mail := &Mail{
+    mail := &gomail.Mail{
         From:    "sender@example.com",
         Name:    "Sender Name",
         Host:    "smtp.example.com",
@@ -60,6 +55,8 @@ func main() {
         User:    "username",
         Pass:    "password",
     }
+    // Port 587 uses STARTTLS. Without TLS the password is not sent to a remote server.
+    mail.SetTLSConfig(&gomail.TLSConfig{StartTLS: true})
 
     // Send a simple email
     err := mail.SetSubject("Test Email").
@@ -72,24 +69,55 @@ func main() {
 }
 ```
 
+`Send` returns nil only after the server accepted the message. A rejection (for example
+`554` after DATA) is returned as an error, so a lost message is never silent.
+
+### From a background worker: SendContext
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+err := mail.SetSubject("Rezervasyonunuz onaylandı").
+    SetContent("<p>Merhaba Ayşe, rezervasyonunuz onaylandı.</p>").
+    SetPlainText("Merhaba Ayşe, rezervasyonunuz onaylandı.").
+    SetTo("customer@example.com").
+    SendContext(ctx)
+```
+
+`SendContext` applies the context's deadline to the SMTP connection and aborts when the
+context is cancelled. `Send()` is `SendContext(context.Background())`: without a deadline
+only the connection steps are bounded (by `Timeout`, default 5s), not the message
+transfer, so prefer `SendContext` in servers and workers.
+
 ## Advanced Features
 
 ### Connection Pooling
 ```go
-mail := &Mail{
-    From:     "sender@example.com",
-    Name:     "Sender Name",
-    Host:     "smtp.example.com",
-    Port:     "587",
-    User:     "username",
-    Pass:     "password",
-}
-
-// Set connection pool size (default: 10)
+// Keep at most 20 idle connections (default: 10)
 mail.SetPoolSize(20)
 ```
 
+Connections are opened on first use, not up front. Before an idle connection is reused it
+is checked with NOOP; a connection the server has closed is replaced, not returned as an
+error. After a failed transaction the connection is reset with RSET, or closed when the
+session state is unknown. Changing Host, Port, User, Pass or LocalName, or passing a new
+`*TLSConfig` to `SetTLSConfig`, starts a new pool. Editing the fields of a `*TLSConfig`
+already in use does not; neither does `SetPoolSize` after the first send. Call `Close()`
+to drop the pool in those cases.
+
+The pool does not cap the number of connections in use: N concurrent sends open up to N
+connections. Keep your worker concurrency at or below what your SMTP provider allows.
+
+### Concurrency
+`Send`, `SendContext` and `SendAsync` can run concurrently on one `Mail` as long as no
+field changes meanwhile. The setters are not synchronised: to send different messages in
+parallel, use one `Mail` per goroutine.
+
 ### HTML Templates with Custom Functions
+Templates are rendered with `html/template`, so data is HTML-escaped: a customer name such
+as `<a href=...>` arrives as text, not as a link. Wrap markup you trust in `template.HTML`
+(from `html/template`).
+
 ```go
 // Configure template engine
 engine := &TemplateEngine{
@@ -124,6 +152,10 @@ Example template (templates/welcome.html):
 ```
 
 ### TLS Configuration
+Certificate verification is on by default: `InsecureSkipVerify` is false unless you set it,
+and `ServerName` defaults to `Host`. `net/smtp` also refuses to send the password over an
+unencrypted connection, except to localhost, so a remote server needs a `TLSConfig`.
+
 ```go
 // STARTTLS configuration
 mail.SetTLSConfig(&TLSConfig{
@@ -216,31 +248,32 @@ fmt.Println(preview)
 ```
 
 ### Error Handling
-```go
-// Basic error handling
-err := mail.Send()
-if err != nil {
-    switch {
-    case strings.Contains(err.Error(), "connection refused"):
-        log.Printf("SMTP server is not accessible: %v", err)
-    case strings.Contains(err.Error(), "invalid auth"):
-        log.Printf("Authentication failed: %v", err)
-    case strings.Contains(err.Error(), "invalid recipient"):
-        log.Printf("Invalid recipient address: %v", err)
-    default:
-        log.Printf("Failed to send email: %v", err)
-    }
-}
+The library never logs. Validation errors are sentinels and name the field, never its
+value, so they are safe to log:
 
-// Async error handling with timeout
-result := mail.SendAsync()
-select {
-case err := <-result:
-    if err != nil {
-        log.Printf("Failed to send email: %v", err)
-    }
-case <-time.After(30 * time.Second):
-    log.Printf("Email sending timed out")
+| Error | Meaning |
+|---|---|
+| `ErrMissingParameter` | A required field is empty |
+| `ErrInvalidAddress` | A From, To, Cc or Bcc address is malformed (`"...: To[1]"`) |
+| `ErrInvalidHeader` | Subject, Name, an address or a filename contains CR or LF |
+
+Server replies arrive as `*textproto.Error` with the SMTP code. Note that a server's reply
+text can quote the recipient address.
+
+```go
+err := mail.SendContext(ctx)
+var reply *textproto.Error
+switch {
+case err == nil:
+    // accepted by the server
+case errors.Is(err, gomail.ErrInvalidAddress), errors.Is(err, gomail.ErrInvalidHeader):
+    // bad input: do not retry
+case errors.As(err, &reply) && reply.Code >= 500:
+    // permanent rejection (e.g. 550 unknown mailbox, 554 rejected, 535 bad credentials)
+case errors.Is(err, context.DeadlineExceeded):
+    // timed out: the message may or may not have been accepted
+default:
+    // network or 4xx: retry later
 }
 ```
 
@@ -279,39 +312,10 @@ engine := &TemplateEngine{
     },
 }
 mail.SetTemplateEngine(engine)
-
-// 3. Template with Layouts
-// templates/layouts/base.html
-/*
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{{.Title}}</title>
-</head>
-<body>
-    <header>{{template "header" .}}</header>
-    <main>{{template "content" .}}</main>
-    <footer>{{template "footer" .}}</footer>
-</body>
-</html>
-*/
-
-// templates/welcome.html
-/*
-{{define "header"}}
-    <h1>Welcome {{.Name}}</h1>
-{{end}}
-
-{{define "content"}}
-    <p>Today is {{formatDate .Date}}</p>
-    <p>Your total: {{formatPrice .Total}}</p>
-{{end}}
-
-{{define "footer"}}
-    <p>Contact us: support@example.com</p>
-{{end}}
-*/
 ```
+
+`RenderTemplate` parses one file, so a template cannot include a separate layout file.
+Keep each email template self-contained.
 
 ### TLS Configuration Examples
 ```go
@@ -335,13 +339,16 @@ mail.SetTLSConfig(&TLSConfig{
     Certificates:       []tls.Certificate{cert},
 })
 
-// 3. TLS with custom verification
+// 3. A server signed by a private CA
+caPEM, err := os.ReadFile("internal-ca.pem")
+if err != nil {
+    log.Fatal(err)
+}
+roots := x509.NewCertPool()
+roots.AppendCertsFromPEM(caPEM)
 mail.SetTLSConfig(&TLSConfig{
-    StartTLS:           true,
-    InsecureSkipVerify: false,
-    ServerName:         "smtp.example.com",
-    MinVersion:         tls.VersionTLS12,
-    MaxVersion:         tls.VersionTLS13,
+    StartTLS: true,
+    RootCAs:  roots,
 })
 
 // 4. Development/Testing TLS (insecure)
@@ -391,125 +398,21 @@ for i, email := range emails {
     
     log.Printf("Progress: %d/%d emails sent", i+1, len(emails))
 }
-
-// 3. Async Sending with Rate Limiting
-results := make(chan error, len(emails))
-for _, email := range emails {
-    go func(e struct {
-        to      string
-        subject string
-        content string
-    }) {
-        results <- mail.SetSubject(e.subject).
-            SetContent(e.content).
-            SetTo(e.to).
-            Send()
-    }(email)
-}
-
-// Collect results
-for i := 0; i < len(emails); i++ {
-    if err := <-results; err != nil {
-        log.Printf("Email error: %v", err)
-    }
-}
 ```
 
-### Error Handling Examples
+The loop changes the message between sends, so it runs sequentially. To send different
+messages in parallel, give each goroutine its own `Mail` (see Concurrency).
+
+### Retries
 ```go
-// 1. Comprehensive Error Handling
-err := mail.Send()
-if err != nil {
-    switch {
-    case strings.Contains(err.Error(), "connection refused"):
-        log.Printf("SMTP server is not accessible: %v", err)
-        // Retry with backup server
-        mail.SetHost("backup-smtp.example.com")
-        err = mail.Send()
-        
-    case strings.Contains(err.Error(), "invalid auth"):
-        log.Printf("Authentication failed: %v", err)
-        // Refresh credentials and retry
-        mail.SetUser("new-user").SetPass("new-pass")
-        err = mail.Send()
-        
-    case strings.Contains(err.Error(), "invalid recipient"):
-        log.Printf("Invalid recipient address: %v", err)
-        // Log invalid address for cleanup
-        logInvalidAddress(mail.To[0])
-        
-    case strings.Contains(err.Error(), "timeout"):
-        log.Printf("Connection timeout: %v", err)
-        // Retry with increased timeout
-        mail.SetTimeout(30 * time.Second)
-        err = mail.Send()
-        
-    default:
-        log.Printf("Unexpected error: %v", err)
-    }
-}
-
-// 2. Retry Logic
-maxRetries := 3
-retryDelay := time.Second
-
-for i := 0; i < maxRetries; i++ {
-    err := mail.Send()
-    if err == nil {
-        break
-    }
-    
-    log.Printf("Attempt %d failed: %v", i+1, err)
-    if i < maxRetries-1 {
-        time.Sleep(retryDelay * time.Duration(i+1))
-    }
-}
-
-// 3. Async Error Handling with Context
-ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer cancel()
-
-result := mail.SendAsync()
-select {
-case err := <-result:
-    if err != nil {
-        log.Printf("Failed to send email: %v", err)
-    }
-case <-ctx.Done():
-    log.Printf("Email sending timed out or cancelled")
-case <-time.After(5 * time.Second):
-    log.Printf("Email sending took too long")
-}
-
-// 4. Batch Error Handling
-type EmailResult struct {
-    To    string
-    Error error
-}
-
-results := make(chan EmailResult, len(recipients))
-for _, to := range recipients {
-    go func(recipient string) {
-        err := mail.SetTo(recipient).Send()
-        results <- EmailResult{To: recipient, Error: err}
-    }(to)
-}
-
-// Process results
-successCount := 0
-failureCount := 0
-for i := 0; i < len(recipients); i++ {
-    result := <-results
-    if result.Error != nil {
-        failureCount++
-        log.Printf("Failed to send to %s: %v", result.To, result.Error)
-    } else {
-        successCount++
-    }
-}
-
-log.Printf("Sending complete: %d successful, %d failed", successCount, failureCount)
+// Up to 3 attempts, waiting 2s and 4s in between; the wait honours ctx.
+err := mail.SendWithRetryContext(ctx, 3)
 ```
+
+Retries stop early on errors a retry cannot fix: the validation errors above and 5xx
+replies. Seekable stream attachments (such as `*os.File`) are rewound before a retry; a
+non-seekable one gets a single attempt. A network error after the message was sent may
+hide an accepted message, so a retry can deliver it twice.
 
 ## Contributing
 Contributions are welcome! For any feedback, bug reports, or contributions, please submit an issue or pull request to the GitHub repository.

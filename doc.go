@@ -13,20 +13,41 @@ Basic Usage:
 		User:    "username",
 		Pass:    "password",
 	}
+	// Port 587 uses STARTTLS; without TLS the password is not sent to a remote server.
+	mail.SetTLSConfig(&gomail.TLSConfig{StartTLS: true})
 
 	err := mail.SetSubject("Test Email").
 		SetContent("This is a test email.").
 		SetTo("recipient@example.com").
 		Send()
 
+A nil error means the server accepted the message; a rejection is returned as a
+*textproto.Error. The package never logs.
+
+Context:
+
+SendContext applies ctx's deadline to the SMTP connection and aborts when ctx is done.
+Send is SendContext(context.Background()):
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := mail.SendContext(ctx)
+
+Errors:
+
+Validation fails before any connection with ErrMissingParameter, ErrInvalidAddress or
+ErrInvalidHeader (CR or LF in a header value). They name the field, never the value.
+
 Features:
 
-  - Connection pooling for better performance
-  - HTML template support with caching
+  - Connection pooling with NOOP health checks
+  - RFC 2047 encoded Subject and sender name, quoted-printable bodies
+  - Optional plain-text alternative (SetPlainText)
+  - HTML templates with html/template escaping and caching
   - File attachments (regular and streaming)
-  - Asynchronous sending
-  - TLS support (STARTTLS and Direct TLS)
-  - CC and BCC recipients
+  - Asynchronous sending and retries
+  - TLS support (STARTTLS and Direct TLS), verification on by default
+  - CC and BCC recipients; Bcc never appears in the headers
   - Rate limiting
   - Email preview
   - Configurable timeouts and keep-alive
@@ -34,9 +55,9 @@ Features:
 
 Connection Pooling:
 
-The package implements connection pooling to reuse SMTP connections:
+Connections are opened on first use and reused; an idle one is checked with NOOP first:
 
-	mail.SetPoolSize(5) // Set pool size to 5 connections
+	mail.SetPoolSize(5) // Keep at most 5 idle connections
 
 HTML Templates:
 

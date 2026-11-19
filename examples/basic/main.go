@@ -18,8 +18,10 @@ func main() {
 		Pass: "password",
 	}
 
+	// Port 587 uses STARTTLS; without TLS the password is not sent to a remote server.
 	// Configure connection pool and timeouts
-	mail.SetPoolSize(5).
+	mail.SetTLSConfig(&gomail.TLSConfig{StartTLS: true}).
+		SetPoolSize(5).
 		SetTimeout(10 * time.Second).
 		SetKeepAlive(30 * time.Second)
 
