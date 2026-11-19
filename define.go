@@ -17,9 +17,17 @@ var (
 	ErrMissingParameter = errors.New("missing parameter")
 	// ErrInvalidAddress reports a malformed From, To, Cc or Bcc address.
 	ErrInvalidAddress = errors.New("gomail: invalid email address")
-	// ErrInvalidHeader reports a CR or LF in a value written to a header or an SMTP command:
-	// From, Name, Subject, a recipient or an attachment filename.
-	ErrInvalidHeader = errors.New("gomail: header value contains CR or LF")
+	// ErrInvalidHeader reports a value that cannot be written to a header or an SMTP command:
+	// a CR or LF in From, Name, Subject, a recipient or an attachment filename, an inline
+	// attachment name unusable as a Content-ID, or a malformed attachment content type.
+	ErrInvalidHeader = errors.New("gomail: invalid header value")
+	// ErrHeaderTooLong reports a header value with a word too long to fold under the
+	// 998-octet line limit of RFC 5322.
+	ErrHeaderTooLong = errors.New("gomail: header value too long")
+	// ErrClosed is returned by a send that was waiting for the rate limiter or for a
+	// connection slot when Close was called. Nothing was sent. A send started after Close
+	// works as before.
+	ErrClosed = errors.New("gomail: mail closed while the send was waiting")
 )
 
 const (
@@ -61,12 +69,19 @@ type TemplateEngine struct {
 	FuncMap    template.FuncMap
 }
 
-// Attachment represents an email attachment with metadata
+// Attachment is a file sent with SetAttachments.
 type Attachment struct {
-	Name        string
+	// Name is the filename. For an inline attachment it is also the Content-ID, so the
+	// HTML refers to it as <img src="cid:Name">; it may then hold only letters, digits
+	// and . _ - @.
+	Name string
+	// ContentType such as "image/png". Empty means detected from the Name's extension,
+	// falling back to application/octet-stream.
 	ContentType string
 	Data        []byte
-	Inline      bool
+	// Inline shows the file inside the HTML body instead of as a download. It applies only
+	// when the body is HTML; otherwise the file is attached normally.
+	Inline bool
 }
 
 // AttachmentReader represents a streaming attachment

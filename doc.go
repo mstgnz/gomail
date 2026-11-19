@@ -35,8 +35,10 @@ Send is SendContext(context.Background()):
 
 Errors:
 
-Validation fails before any connection with ErrMissingParameter, ErrInvalidAddress or
-ErrInvalidHeader (CR or LF in a header value). They name the field, never the value.
+Validation fails before any connection with ErrMissingParameter, ErrInvalidAddress,
+ErrInvalidHeader (CR or LF in a header value, a bad inline name or content type) or
+ErrHeaderTooLong. They name the field, never the value. A send waiting for the rate
+limiter or for a connection slot when Close is called returns ErrClosed.
 
 Features:
 
@@ -44,7 +46,8 @@ Features:
   - RFC 2047 encoded Subject and sender name, quoted-printable bodies
   - Optional plain-text alternative (SetPlainText)
   - HTML templates with html/template escaping and caching
-  - File attachments (regular and streaming)
+  - File attachments (regular, streaming, typed) and inline images (SetAttachments)
+  - Optional cap on concurrent connections (SetMaxConnections)
   - Asynchronous sending and retries
   - TLS support (STARTTLS and Direct TLS), verification on by default
   - CC and BCC recipients; Bcc never appears in the headers

@@ -15,12 +15,13 @@ go get -u github.com/mstgnz/gomail
 - Connection pooling with health checks: idle connections are checked with NOOP and replaced when dead
 - UTF-8 everywhere: Subject and sender name are RFC 2047 encoded, attachment names RFC 2231,
   bodies quoted-printable, so Turkish and other non-ASCII text arrive intact
-- Header injection protection: CR or LF in a header value is refused
+- Header injection protection: CR or LF in a header value is refused; long headers are folded
 - Bcc recipients never appear in the message headers
 - Date and Message-ID headers
 - HTML templates with automatic escaping (`html/template`) and custom functions
 - Optional plain-text alternative (`multipart/alternative`)
-- File attachments (regular and streaming)
+- File attachments (regular, streaming, typed) and inline images (`cid:`)
+- Optional cap on concurrent connections
 - Asynchronous sending and retries with backoff
 - Rate limiting
 - TLS (STARTTLS and direct TLS) with certificate verification on by default
@@ -100,13 +101,22 @@ mail.SetPoolSize(20)
 Connections are opened on first use, not up front. Before an idle connection is reused it
 is checked with NOOP; a connection the server has closed is replaced, not returned as an
 error. After a failed transaction the connection is reset with RSET, or closed when the
-session state is unknown. Changing Host, Port, User, Pass or LocalName, or passing a new
-`*TLSConfig` to `SetTLSConfig`, starts a new pool. Editing the fields of a `*TLSConfig`
-already in use does not; neither does `SetPoolSize` after the first send. Call `Close()`
-to drop the pool in those cases.
+session state is unknown. Changing Host, Port, User, Pass, LocalName, the TLS settings,
+the pool size or the connection cap starts a new pool on the next send. A `*TLSConfig` is
+compared field by field; its `Certificates` slice and `RootCAs` pool by identity, so
+replace them rather than mutating them.
 
-The pool does not cap the number of connections in use: N concurrent sends open up to N
-connections. Keep your worker concurrency at or below what your SMTP provider allows.
+### Connection cap
+```go
+// At most 5 connections open at once; extra sends wait for a free one.
+mail.SetMaxConnections(5)
+```
+
+Most SMTP providers limit concurrent connections per account. With a cap, a send beyond
+it waits for a free connection, honouring its context; `Close()` ends that wait with
+`ErrClosed`. The cap belongs to the `Mail`, so connections still in use when the pool is
+replaced keep counting. The default, 0, means no cap: N concurrent sends open up to N
+connections.
 
 ### Concurrency
 `Send`, `SendContext` and `SendAsync` can run concurrently on one `Mail` as long as no
@@ -192,6 +202,10 @@ for i := 0; i < 100; i++ {
 }
 ```
 
+`Close()` wakes a send that is waiting for the rate limiter; it returns `ErrClosed` and
+sends nothing. Calling `SetRateLimit` again moves waiting sends to the new rate, or lets
+them go at once when the limit is turned off.
+
 ### Asynchronous Email Sending
 ```go
 // Send email asynchronously
@@ -235,6 +249,27 @@ err = mail.SetSubject("Email with Large Attachment").
     Send()
 ```
 
+### Attachments with a content type, and inline images
+```go
+logo, _ := os.ReadFile("logo.png")
+ticket, _ := os.ReadFile("ticket.pdf")
+
+err := mail.SetContent(`<img src="cid:logo.png"><p>Rezervasyonunuz onaylandı.</p>`).
+    SetAttachments([]gomail.Attachment{
+        {Name: "logo.png", Data: logo, Inline: true}, // shown inside the HTML
+        {Name: "ticket.pdf", Data: ticket},           // a normal download
+        {Name: "match.ics", ContentType: "text/calendar; method=REQUEST", Data: ics},
+    }).
+    SendContext(ctx)
+```
+
+An empty `ContentType` is taken from the file extension, falling back to
+`application/octet-stream`. An inline file is sent with `Content-ID: <Name>` inside a
+`multipart/related` part, so its name may hold only letters, digits and `. _ - @`. Inline
+applies to HTML bodies; with a plain-text body the file is attached normally. Mail
+clients accept a name like `logo.png`; a name with `@`, such as `logo@example.com`, is
+also a strict RFC 5322 message id.
+
 ### Email Preview
 ```go
 // Preview email before sending
@@ -255,7 +290,10 @@ value, so they are safe to log:
 |---|---|
 | `ErrMissingParameter` | A required field is empty |
 | `ErrInvalidAddress` | A From, To, Cc or Bcc address is malformed (`"...: To[1]"`) |
-| `ErrInvalidHeader` | Subject, Name, an address or a filename contains CR or LF |
+| `ErrInvalidHeader` | CR or LF in Subject, Name, an address or a filename; a bad inline name or content type |
+| `ErrHeaderTooLong` | A header has a word too long to fold under the 998-octet line limit |
+| `ErrClosed` | `Close()` was called while the send waited for the rate limiter or a connection |
+| `ErrHeaderTooLong` (attachments) | A filename, inline name or content type makes a part header over 998 octets |
 
 Server replies arrive as `*textproto.Error` with the SMTP code. Note that a server's reply
 text can quote the recipient address.
@@ -266,7 +304,8 @@ var reply *textproto.Error
 switch {
 case err == nil:
     // accepted by the server
-case errors.Is(err, gomail.ErrInvalidAddress), errors.Is(err, gomail.ErrInvalidHeader):
+case errors.Is(err, gomail.ErrInvalidAddress), errors.Is(err, gomail.ErrInvalidHeader),
+    errors.Is(err, gomail.ErrHeaderTooLong):
     // bad input: do not retry
 case errors.As(err, &reply) && reply.Code >= 500:
     // permanent rejection (e.g. 550 unknown mailbox, 554 rejected, 535 bad credentials)
@@ -409,8 +448,9 @@ messages in parallel, give each goroutine its own `Mail` (see Concurrency).
 err := mail.SendWithRetryContext(ctx, 3)
 ```
 
-Retries stop early on errors a retry cannot fix: the validation errors above and 5xx
-replies. Seekable stream attachments (such as `*os.File`) are rewound before a retry; a
+Retries stop early on errors a retry cannot fix: the errors in the table above, 5xx
+replies, certificate verification failures, TLS against a plain-text port, and
+credentials refused before AUTH (no TLS). Seekable stream attachments (such as `*os.File`) are rewound before a retry; a
 non-seekable one gets a single attempt. A network error after the message was sent may
 hide an accepted message, so a retry can deliver it twice.
 

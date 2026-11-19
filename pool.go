@@ -22,10 +22,14 @@ var errPoolClosed = errors.New("gomail: pool is closed")
 type Pool struct {
 	config *Mail
 	size   int
+	// slots holds one token per checked-out connection; nil means no cap. New connections
+	// are made only when no idle one is left, so open connections never exceed the cap.
+	slots chan struct{}
 
-	mu     sync.Mutex
-	idle   []*poolConn
-	closed bool
+	mu       sync.Mutex
+	idle     []*poolConn
+	closed   bool
+	closeErr error // what checkout returns once closed
 }
 
 // poolConn keeps the raw connection next to the client: deadlines are set on the conn.
@@ -39,7 +43,8 @@ func (pc *poolConn) close() {
 }
 
 // NewPool creates a pool that keeps at most size idle connections (DefaultPoolSize when
-// size <= 0). It opens no connection; the first send does.
+// size <= 0) and honours the Mail's SetMaxConnections. It opens no connection; the first
+// send does.
 func NewPool(config *Mail, size int) (*Pool, error) {
 	if config == nil {
 		return nil, errors.New("gomail: pool config is nil")
@@ -47,7 +52,11 @@ func NewPool(config *Mail, size int) (*Pool, error) {
 	if size <= 0 {
 		size = defaultPoolSize
 	}
-	return &Pool{config: config, size: size}, nil
+	p := &Pool{config: config, size: size}
+	if config.maxConnections > 0 {
+		p.slots = make(chan struct{}, config.maxConnections)
+	}
+	return p, nil
 }
 
 // createConnection dials, greets, upgrades to TLS when configured and authenticates.
@@ -111,19 +120,72 @@ func (p *Pool) handshake(conn net.Conn) (*smtp.Client, error) {
 		}
 	}
 	// PlainAuth refuses to send credentials over an unencrypted connection, except to localhost.
-	if err := client.Auth(smtp.PlainAuth("", cfg.User, cfg.Pass, cfg.Host)); err != nil {
+	if err := client.Auth(clientAuth{smtp.PlainAuth("", cfg.User, cfg.Pass, cfg.Host)}); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
 	return client, nil
 }
 
-// getConnection returns a live connection: the most recently used idle one that answers
-// NOOP, or a new one. Dead idle connections are closed and skipped, never returned as errors.
+// clientAuth marks errors the client raises before AUTH is sent (no TLS, wrong host): they
+// are configuration errors, so a retry cannot fix them.
+type clientAuth struct{ smtp.Auth }
+
+func (a clientAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	proto, resp, err := a.Auth.Start(server)
+	if err != nil {
+		return "", nil, &authConfigError{err: err}
+	}
+	return proto, resp, nil
+}
+
+type authConfigError struct{ err error }
+
+func (e *authConfigError) Error() string { return e.err.Error() }
+func (e *authConfigError) Unwrap() error { return e.err }
+
+// getConnection checks out a live connection, waiting for a slot when SetMaxConnections is
+// set. Every connection it returns must go back through releaseConnection or discard.
 func (p *Pool) getConnection(ctx context.Context) (*poolConn, error) {
 	if p == nil || p.config == nil {
 		return nil, errors.New("gomail: pool is not initialized")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // before the NOOP probe, which a done ctx would fail on a healthy conn
+	}
+	if p.slots != nil {
+		select {
+		case p.slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		// select picks at random when the slot frees as ctx ends; do not probe with a done ctx.
+		if err := ctx.Err(); err != nil {
+			p.releaseSlot()
+			return nil, err
+		}
+	}
+	pc, err := p.checkout(ctx)
+	if err != nil {
+		p.releaseSlot()
+		return nil, err
+	}
+	return pc, nil
+}
+
+func (p *Pool) releaseSlot() {
+	if p.slots == nil {
+		return
+	}
+	select {
+	case <-p.slots:
+	default: // more releases than checkouts would be a bug; never block on it
+	}
+}
+
+// checkout returns the most recently used idle connection that answers NOOP, or a new one.
+// Dead idle connections are closed and skipped, never returned as errors.
+func (p *Pool) checkout(ctx context.Context) (*poolConn, error) {
 	for {
 		pc, err := p.takeIdle()
 		if err != nil {
@@ -147,7 +209,7 @@ func (p *Pool) takeIdle() (*poolConn, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil, errPoolClosed
+		return nil, p.closeErr
 	}
 	n := len(p.idle)
 	if n == 0 {
@@ -166,12 +228,13 @@ func (p *Pool) alive(ctx context.Context, pc *poolConn) bool {
 	return release() && err == nil
 }
 
-// releaseConnection returns a healthy connection to the pool, or closes it when the pool is
-// full or closed.
+// releaseConnection returns a healthy checked-out connection to the pool, or closes it when
+// the pool is full or closed.
 func (p *Pool) releaseConnection(pc *poolConn) {
 	if pc == nil {
 		return
 	}
+	defer p.releaseSlot()
 	p.mu.Lock()
 	if !p.closed && len(p.idle) < p.size {
 		p.idle = append(p.idle, pc)
@@ -180,6 +243,12 @@ func (p *Pool) releaseConnection(pc *poolConn) {
 	}
 	p.mu.Unlock()
 	pc.close()
+}
+
+// discard closes a checked-out connection whose session state is unknown.
+func (p *Pool) discard(pc *poolConn) {
+	pc.close()
+	p.releaseSlot()
 }
 
 // finish settles a connection after a transaction. A server reply error (4xx/5xx) leaves the
@@ -192,12 +261,12 @@ func (p *Pool) finish(pc *poolConn, err error, resettable bool) {
 	}
 	var reply *textproto.Error
 	if !resettable || !errors.As(err, &reply) {
-		pc.close()
+		p.discard(pc)
 		return
 	}
 	_ = pc.conn.SetDeadline(time.Now().Add(p.config.getTimeout()))
 	if pc.client.Reset() != nil {
-		pc.close()
+		p.discard(pc)
 		return
 	}
 	_ = pc.conn.SetDeadline(time.Time{})
@@ -206,13 +275,20 @@ func (p *Pool) finish(pc *poolConn, err error, resettable bool) {
 
 // Close closes all idle connections. Connections in use are closed when they are released.
 func (p *Pool) Close() {
+	p.closeWith(errPoolClosed)
+}
+
+// closeWith closes the pool; a send still waiting for a slot then gets err.
+func (p *Pool) closeWith(err error) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	idle := p.idle
 	p.idle = nil
-	p.closed = true
+	if !p.closed {
+		p.closed, p.closeErr = true, err
+	}
 	p.mu.Unlock()
 	for _, pc := range idle {
 		pc.close()

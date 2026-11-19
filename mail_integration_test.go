@@ -43,6 +43,8 @@ type mockSMTPServer struct {
 	data     []string // raw message (headers and body) per accepted message
 	commands []string // every command line, across connections
 	conns    int
+	active   int // connections open now
+	peak     int // most connections open at once
 	failed   int // 451 replies given so far
 }
 
@@ -80,11 +82,17 @@ func (s *mockSMTPServer) serve() {
 }
 
 func (s *mockSMTPServer) handleConnection(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-
 	s.mu.Lock()
 	s.conns++
+	s.active++
+	s.peak = max(s.peak, s.active)
 	s.mu.Unlock()
+	defer func() {
+		_ = conn.Close()
+		s.mu.Lock()
+		s.active--
+		s.mu.Unlock()
+	}()
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReader(conn)
@@ -221,6 +229,12 @@ func (s *mockSMTPServer) connCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conns
+}
+
+func (s *mockSMTPServer) peakConns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peak
 }
 
 func TestMailIntegration(t *testing.T) {

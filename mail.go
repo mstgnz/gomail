@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -55,20 +57,52 @@ type Mail struct {
 	pool              *Pool
 	poolKey           poolKey
 	poolSize          int
+	maxConnections    int
+	attachments       []Attachment
 	streamAttachments []AttachmentReader
 	tlsConfig         *TLSConfig
-	rateLimiter       *time.Ticker
-	mu                sync.Mutex // guards pool, poolKey and rateLimiter
+	rateLimiter       *rateLimiter
+	slots             chan struct{} // the connection cap, shared by every pool this Mail makes
+	mu                sync.Mutex    // guards pool, poolKey, slots and rateLimiter
 	ContentType       ContentType
 	TemplateEngine    *TemplateEngine
 	templateCache     map[string]*template.Template
 	templateMutex     sync.RWMutex
 }
 
-// poolKey holds the settings a pooled connection was opened with; a change replaces the pool.
+// poolKey holds the settings a pool was made with; a change replaces the pool.
 type poolKey struct {
 	host, port, user, pass, localName string
-	tls                               *TLSConfig
+	size, maxConnections              int
+	tls                               tlsKey
+}
+
+// tlsKey compares a TLSConfig by value, so editing a config already in use is noticed.
+// Certificates and RootCAs compare by identity.
+type tlsKey struct {
+	set, startTLS, insecure bool
+	serverName              string
+	rootCAs                 *x509.CertPool
+	firstCert               *tls.Certificate
+	numCerts                int
+}
+
+func newTLSKey(c *TLSConfig) tlsKey {
+	if c == nil {
+		return tlsKey{}
+	}
+	k := tlsKey{
+		set:        true,
+		startTLS:   c.StartTLS,
+		insecure:   c.InsecureSkipVerify,
+		serverName: c.ServerName,
+		rootCAs:    c.RootCAs,
+		numCerts:   len(c.Certificates),
+	}
+	if len(c.Certificates) > 0 {
+		k.firstCert = &c.Certificates[0]
+	}
+	return k
 }
 
 // SetFrom sets the sender's email address
@@ -167,9 +201,23 @@ func (m *Mail) SetAttachment(attachments map[string][]byte) *Mail {
 	return m
 }
 
-// SetPoolSize sets the connection pool size
+// SetPoolSize sets how many idle connections the pool keeps.
 func (m *Mail) SetPoolSize(size int) *Mail {
 	m.poolSize = size
+	return m
+}
+
+// SetMaxConnections caps the connections open at once. A send beyond the cap waits for a
+// free connection, honouring its context. Zero, the default, means no cap.
+func (m *Mail) SetMaxConnections(n int) *Mail {
+	m.maxConnections = n
+	return m
+}
+
+// SetAttachments sets attachments with a content type, and inline files for the HTML body.
+// They are sent in addition to SetAttachment and SetStreamAttachment.
+func (m *Mail) SetAttachments(attachments []Attachment) *Mail {
+	m.attachments = attachments
 	return m
 }
 
@@ -236,13 +284,27 @@ func (m *Mail) SendWithRetryContext(ctx context.Context, maxRetries int) error {
 	return fmt.Errorf("failed to send email after %d attempts, last error: %w", attempts, lastErr)
 }
 
-// isPermanent reports errors that a retry cannot fix.
+// isPermanent reports errors that a retry cannot fix: invalid input, a closed Mail, a 5xx
+// reply, and configuration errors (certificate verification, TLS against a plain port,
+// credentials refused by the client before AUTH).
 func isPermanent(err error) bool {
-	if errors.Is(err, ErrMissingParameter) || errors.Is(err, ErrInvalidAddress) || errors.Is(err, ErrInvalidHeader) {
-		return true
+	for _, target := range []error{ErrMissingParameter, ErrInvalidAddress, ErrInvalidHeader, ErrHeaderTooLong, ErrClosed} {
+		if errors.Is(err, target) {
+			return true
+		}
 	}
-	var reply *textproto.Error
-	return errors.As(err, &reply) && reply.Code >= 500
+	var (
+		reply     *textproto.Error
+		verify    *tls.CertificateVerificationError
+		unknownCA x509.UnknownAuthorityError
+		hostname  x509.HostnameError
+		invalid   x509.CertificateInvalidError
+		record    tls.RecordHeaderError
+		auth      *authConfigError
+	)
+	return (errors.As(err, &reply) && reply.Code >= 500) ||
+		errors.As(err, &verify) || errors.As(err, &unknownCA) || errors.As(err, &hostname) ||
+		errors.As(err, &invalid) || errors.As(err, &record) || errors.As(err, &auth)
 }
 
 // streamOffsets records where each stream attachment starts; ok is false if one cannot seek.
@@ -280,16 +342,15 @@ func (m *Mail) SendContext(ctx context.Context) error {
 	if err := m.check(); err != nil {
 		return err
 	}
+	if err := m.waitRateLimit(ctx); err != nil {
+		return err
+	}
 
-	m.mu.Lock()
-	limiter := m.rateLimiter
-	m.mu.Unlock()
-	if limiter != nil {
-		select {
-		case <-limiter.C:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	// Headers are built before any connection, so a header error never touches the network.
+	boundary := multipart.NewWriter(io.Discard).Boundary()
+	header, err := m.headerBlock(boundary)
+	if err != nil {
+		return err
 	}
 
 	pool, err := m.getPool()
@@ -297,16 +358,22 @@ func (m *Mail) SendContext(ctx context.Context) error {
 		return err
 	}
 	pc, err := pool.getConnection(ctx)
+	if errors.Is(err, errPoolClosed) {
+		// A settings change replaced the pool while this send waited for a slot.
+		if pool, err = m.getPool(); err == nil {
+			pc, err = pool.getConnection(ctx)
+		}
+	}
 	if err != nil {
 		return withContext(ctx, err)
 	}
 
 	deadline, _ := ctx.Deadline()
 	release := guard(ctx, pc.conn, deadline)
-	resettable, err := m.transmit(pc.client)
+	resettable, err := m.transmit(pc.client, header, boundary)
 	if !release() {
 		// ctx fired during the exchange: the deadline is poisoned and the session state unknown.
-		pc.close()
+		pool.discard(pc)
 		if err == nil {
 			return nil // the server accepted the message before ctx fired
 		}
@@ -316,11 +383,43 @@ func (m *Mail) SendContext(ctx context.Context) error {
 	return withContext(ctx, err)
 }
 
+// rateLimitWaitHook, set only by tests, runs when a send starts waiting for the limiter.
+var rateLimitWaitHook func()
+
+// waitRateLimit blocks until the rate limiter allows a send. A limiter replaced or turned
+// off meanwhile is read again; one stopped by Close ends the wait with ErrClosed.
+func (m *Mail) waitRateLimit(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		limiter := m.rateLimiter
+		m.mu.Unlock()
+		if limiter == nil {
+			return nil
+		}
+		if rateLimitWaitHook != nil {
+			rateLimitWaitHook()
+		}
+		select {
+		case <-limiter.ticker.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-limiter.done:
+			if limiter.closed {
+				return ErrClosed
+			}
+		}
+	}
+}
+
 // getPool returns the pool, replacing it when the connection settings changed since it was made.
 func (m *Mail) getPool() (*Pool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := poolKey{host: m.Host, port: m.Port, user: m.User, pass: m.Pass, localName: m.LocalName, tls: m.tlsConfig}
+	key := poolKey{
+		host: m.Host, port: m.Port, user: m.User, pass: m.Pass, localName: m.LocalName,
+		size: m.poolSize, maxConnections: m.maxConnections, tls: newTLSKey(m.tlsConfig),
+	}
 	if m.pool != nil && m.poolKey != key {
 		m.pool.Close()
 		m.pool = nil
@@ -330,6 +429,14 @@ func (m *Mail) getPool() (*Pool, error) {
 		if err != nil {
 			return nil, err
 		}
+		// One cap per Mail: connections still out from a replaced pool keep counting.
+		switch {
+		case m.maxConnections <= 0:
+			m.slots = nil
+		case cap(m.slots) != m.maxConnections:
+			m.slots = make(chan struct{}, m.maxConnections)
+		}
+		pool.slots = m.slots
 		m.pool, m.poolKey = pool, key
 	}
 	return m.pool, nil
@@ -338,7 +445,7 @@ func (m *Mail) getPool() (*Pool, error) {
 // transmit runs one SMTP transaction. resettable is false once the body is partly written:
 // the terminator is then never sent, so closing the connection makes the server discard
 // the partial message, and RSET cannot be sent inside DATA.
-func (m *Mail) transmit(client *smtp.Client) (resettable bool, err error) {
+func (m *Mail) transmit(client *smtp.Client, header, boundary string) (resettable bool, err error) {
 	if err := client.Mail(m.From); err != nil {
 		return true, err
 	}
@@ -351,7 +458,7 @@ func (m *Mail) transmit(client *smtp.Client) (resettable bool, err error) {
 	if err != nil {
 		return true, err
 	}
-	if err := m.writeMessage(w); err != nil {
+	if err := m.writeMessage(w, header, boundary); err != nil {
 		return false, err
 	}
 	// Close sends the terminator; its error is the server's verdict on the message.
@@ -365,88 +472,159 @@ func (m *Mail) recipients() []string {
 	return append(all, m.Bcc...)
 }
 
-// writeMessage writes headers, body and attachments, then closes the multipart writer.
-func (m *Mail) writeMessage(w io.Writer) error {
+// writeMessage writes the headers, body and attachments, then closes the multipart writer.
+func (m *Mail) writeMessage(w io.Writer, header, boundary string) error {
 	mw := multipart.NewWriter(w)
-	if _, err := io.WriteString(w, m.headerBlock(mw.Boundary())); err != nil {
+	if err := mw.SetBoundary(boundary); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, header); err != nil {
 		return err
 	}
 	if err := m.writeBody(mw); err != nil {
 		return err
 	}
 	for name, data := range m.Attachments {
-		if err := writeAttachment(mw, name, bytes.NewReader(data)); err != nil {
+		if err := writeAttachment(mw, name, octetStream, false, bytes.NewReader(data)); err != nil {
+			return err
+		}
+	}
+	html := m.isHTML()
+	for _, a := range m.attachments {
+		if a.Inline && html {
+			continue // written inside multipart/related by writeBody
+		}
+		if err := writeAttachment(mw, a.Name, a.contentType(), false, bytes.NewReader(a.Data)); err != nil {
 			return err
 		}
 	}
 	for _, a := range m.streamAttachments {
-		if err := writeAttachment(mw, a.Name, a.Reader); err != nil {
+		if err := writeAttachment(mw, a.Name, octetStream, false, a.Reader); err != nil {
 			return err
 		}
 	}
 	return mw.Close()
 }
 
-// headerBlock renders the top-level headers. Bcc is never written: blind recipients only
-// appear in RCPT TO.
-func (m *Mail) headerBlock(boundary string) string {
-	var b strings.Builder
-	h := func(name, value string) {
-		b.WriteString(name)
-		b.WriteString(": ")
-		b.WriteString(value)
-		b.WriteString("\r\n")
+// headerBlock renders the folded top-level headers. Bcc is never written: blind recipients
+// only appear in RCPT TO.
+func (m *Mail) headerBlock(boundary string) (string, error) {
+	fields := [][2]string{
+		{"From", (&mail.Address{Name: m.Name, Address: m.From}).String()},
+		{"To", formatAddressList(m.To)},
 	}
-	h("From", (&mail.Address{Name: m.Name, Address: m.From}).String())
-	h("To", formatAddressList(m.To))
 	if len(m.Cc) > 0 {
-		h("Cc", formatAddressList(m.Cc))
+		fields = append(fields, [2]string{"Cc", formatAddressList(m.Cc)})
 	}
-	h("Subject", encodeHeaderText(m.Subject))
-	h("Date", time.Now().Format(time.RFC1123Z))
-	h("Message-ID", "<"+rand.Text()+"@"+m.From[strings.LastIndex(m.From, "@")+1:]+">")
-	h("MIME-Version", "1.0")
-	h("Content-Type", mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": boundary}))
+	fields = append(fields,
+		[2]string{"Subject", mime.QEncoding.Encode("utf-8", m.Subject)},
+		[2]string{"Date", time.Now().Format(time.RFC1123Z)},
+		[2]string{"Message-ID", "<" + rand.Text() + "@" + m.From[strings.LastIndex(m.From, "@")+1:] + ">"},
+		[2]string{"MIME-Version", "1.0"},
+		[2]string{"Content-Type", mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": boundary})},
+	)
+	var b strings.Builder
+	for _, f := range fields {
+		line, err := foldHeader(f[0], f[1])
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(line)
+	}
 	b.WriteString("\r\n")
-	return b.String()
+	return b.String(), nil
 }
 
-// formatAddressList folds after each address so a long list stays under the line limit.
+// RFC 5322 §2.1.1: lines SHOULD stay within 78 octets and MUST stay within 998.
+const (
+	foldLineLength = 78
+	maxLineLength  = 998
+)
+
+// foldHeader renders "name: value\r\n", inserting CRLF before a space wherever a line would
+// pass foldLineLength. A word that cannot fit in maxLineLength is ErrHeaderTooLong.
+func foldHeader(name, value string) (string, error) {
+	var b strings.Builder
+	b.WriteString(name)
+	b.WriteString(":")
+	line := len(name) + 1
+	for i, word := range strings.Split(value, " ") {
+		// Never fold before an empty word: a line of only whitespace is not allowed.
+		if i > 0 && word != "" && line+1+len(word) > foldLineLength {
+			b.WriteString("\r\n")
+			line = 0
+		}
+		b.WriteString(" ")
+		b.WriteString(word)
+		line += 1 + len(word)
+		if line > maxLineLength {
+			return "", fmt.Errorf("%w: %s", ErrHeaderTooLong, name)
+		}
+	}
+	b.WriteString("\r\n")
+	return b.String(), nil
+}
+
 func formatAddressList(addrs []string) string {
 	parts := make([]string, len(addrs))
 	for i, a := range addrs {
 		parts[i] = (&mail.Address{Address: a}).String()
 	}
-	return strings.Join(parts, ",\r\n ")
-}
-
-// encodeHeaderText RFC 2047-encodes s and folds between encoded words.
-func encodeHeaderText(s string) string {
-	return strings.ReplaceAll(mime.QEncoding.Encode("utf-8", s), "?= =?", "?=\r\n =?")
+	return strings.Join(parts, ", ")
 }
 
 const (
 	htmlContentType  = "text/html; charset=UTF-8"
 	plainContentType = "text/plain; charset=UTF-8"
+	octetStream      = "application/octet-stream"
 )
 
+func (m *Mail) isHTML() bool {
+	return m.ContentType != TextPlain && m.ContentType != TextMarkdown
+}
+
+// writeBody writes the text part. Inline attachments wrap an HTML body in multipart/related
+// (RFC 2387) so the HTML can show them through cid: URLs.
 func (m *Mail) writeBody(mw *multipart.Writer) error {
-	if m.ContentType == TextPlain || m.ContentType == TextMarkdown {
+	if !m.isHTML() {
 		return writeQuotedPart(mw, plainContentType, m.Content)
 	}
-	if m.PlainText == "" {
-		return writeQuotedPart(mw, htmlContentType, m.Content)
+	var inline []Attachment
+	for _, a := range m.attachments {
+		if a.Inline {
+			inline = append(inline, a)
+		}
+	}
+	if len(inline) == 0 {
+		return m.writeHTML(mw)
 	}
 
-	altBoundary := multipart.NewWriter(io.Discard).Boundary()
-	part, err := mw.CreatePart(textproto.MIMEHeader{
-		"Content-Type": {mime.FormatMediaType("multipart/alternative", map[string]string{"boundary": altBoundary})},
-	})
+	rootType := "text/html"
+	if m.PlainText != "" {
+		rootType = "multipart/alternative"
+	}
+	related, err := createNested(mw, "multipart/related", map[string]string{"type": rootType})
 	if err != nil {
 		return err
 	}
-	alt := multipart.NewWriter(part)
-	if err := alt.SetBoundary(altBoundary); err != nil {
+	if err := m.writeHTML(related); err != nil {
+		return err
+	}
+	for _, a := range inline {
+		if err := writeAttachment(related, a.Name, a.contentType(), true, bytes.NewReader(a.Data)); err != nil {
+			return err
+		}
+	}
+	return related.Close()
+}
+
+// writeHTML writes the HTML body, as multipart/alternative when PlainText is set.
+func (m *Mail) writeHTML(mw *multipart.Writer) error {
+	if m.PlainText == "" {
+		return writeQuotedPart(mw, htmlContentType, m.Content)
+	}
+	alt, err := createNested(mw, "multipart/alternative", nil)
+	if err != nil {
 		return err
 	}
 	// RFC 2046: the preferred (richest) alternative comes last.
@@ -457,6 +635,30 @@ func (m *Mail) writeBody(mw *multipart.Writer) error {
 		return err
 	}
 	return alt.Close()
+}
+
+// createNested adds a multipart part of mediaType to mw and returns the writer for its parts.
+func createNested(mw *multipart.Writer, mediaType string, params map[string]string) (*multipart.Writer, error) {
+	boundary := multipart.NewWriter(io.Discard).Boundary()
+	all := map[string]string{"boundary": boundary}
+	maps.Copy(all, params)
+	part, err := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {mime.FormatMediaType(mediaType, all)}})
+	if err != nil {
+		return nil, err
+	}
+	nested := multipart.NewWriter(part)
+	return nested, nested.SetBoundary(boundary)
+}
+
+// contentType is ContentType, else the type of the Name's extension, else octet-stream.
+func (a Attachment) contentType() string {
+	if a.ContentType != "" {
+		return a.ContentType
+	}
+	if t := mime.TypeByExtension(filepath.Ext(a.Name)); t != "" {
+		return t
+	}
+	return octetStream
 }
 
 // writeQuotedPart writes body quoted-printable, which keeps every line under 77 octets
@@ -476,13 +678,20 @@ func writeQuotedPart(mw *multipart.Writer, contentType, body string) error {
 	return qp.Close()
 }
 
-// writeAttachment writes r base64-encoded. FormatMediaType encodes a non-ASCII filename per RFC 2231.
-func writeAttachment(mw *multipart.Writer, name string, r io.Reader) error {
-	part, err := mw.CreatePart(textproto.MIMEHeader{
-		"Content-Type":              {"application/octet-stream"},
+// writeAttachment writes r base64-encoded. FormatMediaType encodes a non-ASCII filename per
+// RFC 2231. An inline part gets Content-ID <name>, which check has validated.
+func writeAttachment(mw *multipart.Writer, name, contentType string, inline bool, r io.Reader) error {
+	disposition := "attachment"
+	header := textproto.MIMEHeader{
+		"Content-Type":              {contentType},
 		"Content-Transfer-Encoding": {"base64"},
-		"Content-Disposition":       {mime.FormatMediaType("attachment", map[string]string{"filename": name})},
-	})
+	}
+	if inline {
+		disposition = "inline"
+		header.Set("Content-ID", "<"+name+">")
+	}
+	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": name}))
+	part, err := mw.CreatePart(header)
 	if err != nil {
 		return err
 	}
@@ -570,14 +779,19 @@ func (m *Mail) check() error {
 			}
 		}
 	}
-	return nil
+	if err := m.checkAttachments(); err != nil {
+		return err
+	}
+	// Renders the headers once to catch ErrHeaderTooLong; the boundary is a placeholder.
+	_, err := m.headerBlock("x")
+	return err
 }
 
 // checkHeaderValues refuses CR or LF in any value that reaches a header or an SMTP command.
 func (m *Mail) checkHeaderValues() error {
 	for _, f := range []struct{ field, value string }{{"From", m.From}, {"Name", m.Name}, {"Subject", m.Subject}} {
 		if hasLineBreak(f.value) {
-			return fmt.Errorf("%w: %s", ErrInvalidHeader, f.field)
+			return fmt.Errorf("%w: %s contains CR or LF", ErrInvalidHeader, f.field)
 		}
 	}
 	for _, list := range []struct {
@@ -586,21 +800,84 @@ func (m *Mail) checkHeaderValues() error {
 	}{{"To", m.To}, {"Cc", m.Cc}, {"Bcc", m.Bcc}} {
 		for i, a := range list.addrs {
 			if hasLineBreak(a) {
-				return fmt.Errorf("%w: %s[%d]", ErrInvalidHeader, list.field, i)
+				return fmt.Errorf("%w: %s[%d] contains CR or LF", ErrInvalidHeader, list.field, i)
 			}
 		}
 	}
 	for name := range m.Attachments {
 		if hasLineBreak(name) {
-			return fmt.Errorf("%w: attachment filename", ErrInvalidHeader)
+			return fmt.Errorf("%w: an attachment filename contains CR or LF", ErrInvalidHeader)
 		}
 	}
 	for i, a := range m.streamAttachments {
 		if hasLineBreak(a.Name) {
-			return fmt.Errorf("%w: stream attachment %d filename", ErrInvalidHeader, i)
+			return fmt.Errorf("%w: stream attachment %d filename contains CR or LF", ErrInvalidHeader, i)
+		}
+	}
+	for i, a := range m.attachments {
+		if hasLineBreak(a.Name) || hasLineBreak(a.ContentType) {
+			return fmt.Errorf("%w: attachment %d name or content type contains CR or LF", ErrInvalidHeader, i)
 		}
 	}
 	return nil
+}
+
+// contentIDPattern keeps an inline name valid inside Content-ID <...> and a cid: URL.
+var contentIDPattern = regexp.MustCompile(`^[A-Za-z0-9._@-]+$`)
+
+// checkAttachments validates content types, inline names when the body is HTML, and the
+// length of every part header.
+func (m *Mail) checkAttachments() error {
+	for name := range m.Attachments {
+		if err := checkFilenameLength(name, "an attachment filename"); err != nil {
+			return err
+		}
+	}
+	for i, a := range m.streamAttachments {
+		if err := checkFilenameLength(a.Name, fmt.Sprintf("stream attachment %d filename", i)); err != nil {
+			return err
+		}
+	}
+	seen := make(map[string]bool)
+	for i, a := range m.attachments {
+		if err := checkFilenameLength(a.Name, fmt.Sprintf("attachment %d name", i)); err != nil {
+			return err
+		}
+		if a.ContentType != "" {
+			if _, _, err := mime.ParseMediaType(a.ContentType); err != nil {
+				return fmt.Errorf("%w: attachment %d content type is invalid", ErrInvalidHeader, i)
+			}
+			if partHeaderTooLong("Content-Type", a.ContentType) {
+				return fmt.Errorf("%w: attachment %d content type", ErrHeaderTooLong, i)
+			}
+		}
+		if !a.Inline || !m.isHTML() {
+			continue
+		}
+		if !contentIDPattern.MatchString(a.Name) {
+			return fmt.Errorf("%w: inline attachment %d name must use only letters, digits and . _ - @", ErrInvalidHeader, i)
+		}
+		if seen[a.Name] {
+			return fmt.Errorf("%w: inline attachment %d repeats a name", ErrInvalidHeader, i)
+		}
+		seen[a.Name] = true
+	}
+	return nil
+}
+
+// checkFilenameLength refuses a filename whose Content-Disposition (RFC 2231 encoding takes
+// up to 6 octets per non-ASCII rune) or Content-ID line would pass maxLineLength; part
+// headers are not folded.
+func checkFilenameLength(name, what string) error {
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": name})
+	if partHeaderTooLong("Content-Disposition", disposition) || partHeaderTooLong("Content-ID", "<"+name+">") {
+		return fmt.Errorf("%w: %s", ErrHeaderTooLong, what)
+	}
+	return nil
+}
+
+func partHeaderTooLong(name, value string) bool {
+	return len(name)+len(": ")+len(value) > maxLineLength
 }
 
 func hasLineBreak(s string) bool {
@@ -658,31 +935,40 @@ type RateLimit struct {
 	PerSecond int
 }
 
-// SetRateLimit configures rate limiting
+// SetRateLimit configures rate limiting. A nil, disabled or non-positive limit turns it off.
+// Sends already waiting move to the new limit, or go at once when it is turned off.
 func (m *Mail) SetRateLimit(limit *RateLimit) *Mail {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if limit != nil && limit.Enabled {
-		if limit.PerSecond <= 0 {
-			// Invalid rate limit, disable it
-			if m.rateLimiter != nil {
-				m.rateLimiter.Stop()
-				m.rateLimiter = nil
-			}
-			return m
-		}
-		interval := time.Second / time.Duration(limit.PerSecond)
-		if m.rateLimiter != nil {
-			m.rateLimiter.Stop()
-		}
-		m.rateLimiter = time.NewTicker(interval)
-	} else {
-		if m.rateLimiter != nil {
-			m.rateLimiter.Stop()
-			m.rateLimiter = nil
-		}
+	if m.rateLimiter != nil {
+		m.rateLimiter.stop(false)
+		m.rateLimiter = nil
+	}
+	if limit != nil && limit.Enabled && limit.PerSecond > 0 {
+		m.rateLimiter = newRateLimiter(time.Second / time.Duration(limit.PerSecond))
 	}
 	return m
+}
+
+// rateLimiter wraps a Ticker so that stopping it also wakes waiting senders:
+// Ticker.Stop never closes C.
+type rateLimiter struct {
+	ticker *time.Ticker
+	done   chan struct{}
+	closed bool // written before done is closed; true when Mail.Close stopped it
+	once   sync.Once
+}
+
+func newRateLimiter(interval time.Duration) *rateLimiter {
+	return &rateLimiter{ticker: time.NewTicker(interval), done: make(chan struct{})}
+}
+
+func (r *rateLimiter) stop(closed bool) {
+	r.once.Do(func() {
+		r.closed = closed
+		r.ticker.Stop()
+		close(r.done)
+	})
 }
 
 // SetTemplateEngine configures the template engine
@@ -741,17 +1027,18 @@ func (m *Mail) RenderTemplate(name string, data any) error {
 	return nil
 }
 
-// Close releases all resources held by the Mail instance (pool connections, rate limiter).
-// Call this when the Mail instance is no longer needed.
+// Close releases the pool connections and the rate limiter. A send waiting for the rate
+// limiter or for a connection slot returns ErrClosed; a send started later opens a new
+// pool, without rate limiting.
 func (m *Mail) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.rateLimiter != nil {
-		m.rateLimiter.Stop()
+		m.rateLimiter.stop(true)
 		m.rateLimiter = nil
 	}
 	if m.pool != nil {
-		m.pool.Close()
+		m.pool.closeWith(ErrClosed)
 		m.pool = nil
 	}
 }
@@ -764,15 +1051,15 @@ func (m *Mail) PreviewEmail() (string, error) {
 	}
 
 	var preview strings.Builder
-	preview.WriteString(fmt.Sprintf("From: %s <%s>\n", m.Name, m.From))
-	preview.WriteString(fmt.Sprintf("To: %s\n", strings.Join(m.To, ", ")))
+	fmt.Fprintf(&preview, "From: %s <%s>\n", m.Name, m.From)
+	fmt.Fprintf(&preview, "To: %s\n", strings.Join(m.To, ", "))
 	if len(m.Cc) > 0 {
-		preview.WriteString(fmt.Sprintf("Cc: %s\n", strings.Join(m.Cc, ", ")))
+		fmt.Fprintf(&preview, "Cc: %s\n", strings.Join(m.Cc, ", "))
 	}
 	if len(m.Bcc) > 0 {
-		preview.WriteString(fmt.Sprintf("Bcc: %s\n", strings.Join(m.Bcc, ", ")))
+		fmt.Fprintf(&preview, "Bcc: %s\n", strings.Join(m.Bcc, ", "))
 	}
-	preview.WriteString(fmt.Sprintf("Subject: %s\n\n", m.Subject))
+	fmt.Fprintf(&preview, "Subject: %s\n\n", m.Subject)
 	preview.WriteString(m.Content)
 
 	return preview.String(), nil

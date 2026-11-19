@@ -73,6 +73,7 @@ type mimePart struct {
 	contentType string
 	encoding    string
 	disposition string
+	contentID   string
 	body        []byte
 }
 
@@ -110,7 +111,13 @@ func readParts(t *testing.T, contentType string, r io.Reader) []mimePart {
 		if err != nil {
 			t.Fatalf("reading part %q: %v", ct, err)
 		}
-		parts = append(parts, mimePart{contentType: ct, encoding: cte, disposition: p.Header.Get("Content-Disposition"), body: data})
+		parts = append(parts, mimePart{
+			contentType: ct,
+			encoding:    cte,
+			disposition: p.Header.Get("Content-Disposition"),
+			contentID:   p.Header.Get("Content-ID"),
+			body:        data,
+		})
 	}
 }
 
